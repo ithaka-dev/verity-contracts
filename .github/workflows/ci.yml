@@ -18,8 +18,14 @@ jobs:
       - run: forge fmt --check
       - run: forge build --sizes
       - run: forge test -vvv
+      # Fuzz and invariant entries encode the run count and profile-dependent medians, so a snapshot
+      # taken under one profile can never match the other. CI sets FOUNDRY_PROFILE=ci, which is how
+      # this gate came to be failing on a snapshot generated locally. Restricted to the
+      # deterministic tests, where a gas change is a real signal rather than a profile artefact.
       - name: gas snapshot is current
-        run: forge snapshot --check || (echo "::error::gas snapshot out of date; run forge snapshot" && exit 1)
+        run: |
+          forge snapshot --check --no-match-test '(testFuzz_|invariant_)' \
+            || (echo "::error::gas snapshot out of date; run: forge snapshot --no-match-test '(testFuzz_|invariant_)'" && exit 1)
 
   no-raw-ecrecover:
     name: ecrecover is not called directly
@@ -69,4 +75,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
-      - run: forge coverage --report summary
+      # Thresholds live in script/check-coverage.py so they are runnable locally and reviewable as
+      # a diff, rather than buried in shell inside a workflow.
+      - name: coverage thresholds
+        run: |
+          forge coverage --report summary --no-match-coverage '(script|test)' > coverage.txt
+          cat coverage.txt
+          python3 script/check-coverage.py coverage.txt

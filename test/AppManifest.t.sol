@@ -143,6 +143,30 @@ contract AppManifestTest is Test {
         assertFalse(manifest.burnOnUpgrade());
     }
 
+    /// @dev The most powerful privilege in the system, and it was covered by nothing: deleting
+    /// `onlyDeveloper` from `setMintAuthorizer` survived the entire suite. Anyone could then point
+    /// any app's authorizer at themselves, sign their own authorizations, and mint unlimited
+    /// licences for every published version — no payment, no developer involvement, and no patch
+    /// available afterwards.
+    function test_onlyDeveloperMaySetMintAuthorizer() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(AppManifest.NotDeveloper.selector, stranger));
+        manifest.setMintAuthorizer(stranger);
+
+        assertEq(manifest.mintAuthorizer(), dev, "authorizer must be unchanged");
+    }
+
+    /// One of the developer's two ADR 0004 knobs. Anyone able to call this could mark arbitrary
+    /// transitions permitted.
+    function test_onlyDeveloperMaySetUpgradePrice() public {
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(AppManifest.NotDeveloper.selector, stranger));
+        manifest.setUpgradePrice("1.0.0", "2.0.0", 0, true);
+
+        (, bool allowed) = manifest.upgradePrice("1.0.0", "2.0.0");
+        assertFalse(allowed, "transition must remain forbidden");
+    }
+
     function test_onlyDeveloperMaySetKnobs() public {
         vm.startPrank(stranger);
         vm.expectRevert(abi.encodeWithSelector(AppManifest.NotDeveloper.selector, stranger));

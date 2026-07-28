@@ -240,6 +240,10 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         _guardUnpublishedVersionCannotMint(mi, actor, burns);
         _guardBurnTermCannotBeFlipped(mi, from, to, actor, burns);
         _guardForbiddenDowngradeIsRefused(mi, from, to, actor, burns);
+        _guardNonHolderCannotUpgrade(mi, from, to, burns);
+        _guardUnpricedTransitionIsRefused(mi, actor, burns);
+        _guardSameVersionIsRefused(mi, from, actor, burns);
+        _guardStrangerCannotSetKnobs(mi);
         _guardVersionCannotBeRepublished(mi);
         _guardStrangerCannotPublish(mi);
 
@@ -409,6 +413,107 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         vm.prank(actor);
         try token.upgrade(auth, signature) {
             _bypassed("a downgrade ran while the developer forbade downgrades");
+        } catch {}
+    }
+
+    /// @dev Every other guard mints the source licence first so the attempt is otherwise legal.
+    /// That setup is what made this case unreachable: an upgrade by someone holding none of the
+    /// source was never attempted, so `NotAHolder` was covered by nothing.
+    ///
+    /// It is not redundant with the burn. Under `burnOnUpgrade = false` nothing downstream reverts,
+    /// so without this check a party holding no source licence could spend an upgrade authorization
+    /// and receive the target version at the discounted transition price.
+    function _guardNonHolderCannotUpgrade(
+        uint256 mi,
+        string memory from,
+        string memory to,
+        bool burns
+    ) private {
+        // A fresh address each time, so it reliably holds nothing.
+        address pauper = address(uint160(uint256(keccak256(abi.encode("pauper", nonceCounter)))));
+        if (token.balanceOf(pauper, token.tokenIdFor(address(manifests[mi]), from)) != 0) return;
+
+        LicenseToken.MintAuthorization memory auth =
+            _auth(mi, from, to, pauper, burns, ++nonceCounter, block.timestamp + 1 days);
+        bytes memory signature = _sign(auth);
+        vm.prank(pauper);
+        try token.upgrade(auth, signature) {
+            _bypassed("someone holding no source licence completed an upgrade");
+        } catch {}
+    }
+
+    /// Doing nothing keeps a holder on the digest they licensed (ADR 0003). A transition the
+    /// developer has not permitted must not happen — and the other guards price it first, so this
+    /// was never attempted.
+    function _guardUnpricedTransitionIsRefused(uint256 mi, address actor, bool burns) private {
+        AppManifest m = manifests[mi];
+        uint256 count = published[mi].length;
+        if (count < 3) return; // needs a pair the other guards have not already priced
+
+        string memory from = published[mi][count - 2];
+        string memory to = published[mi][count - 1];
+        (, bool allowed) = m.upgradePrice(from, to);
+        if (allowed) return; // already permitted; nothing forbidden to attempt
+
+        if (token.balanceOf(actor, token.tokenIdFor(address(m), from)) == 0) {
+            _mintTo(mi, from, actor);
+        }
+        LicenseToken.MintAuthorization memory auth =
+            _auth(mi, from, to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+        bytes memory signature = _sign(auth);
+        vm.prank(actor);
+        try token.upgrade(auth, signature) {
+            _bypassed("an unpriced transition was upgraded");
+        } catch {}
+    }
+
+    function _guardSameVersionIsRefused(
+        uint256 mi,
+        string memory version,
+        address actor,
+        bool burns
+    ) private {
+        AppManifest m = manifests[mi];
+        (, bool allowed) = m.upgradePrice(version, version);
+        if (!allowed) {
+            vm.prank(developer);
+            m.setUpgradePrice(version, version, 0, true);
+        }
+        if (token.balanceOf(actor, token.tokenIdFor(address(m), version)) == 0) {
+            _mintTo(mi, version, actor);
+        }
+        LicenseToken.MintAuthorization memory auth =
+            _auth(mi, version, version, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+        bytes memory signature = _sign(auth);
+        vm.prank(actor);
+        try token.upgrade(auth, signature) {
+            _bypassed("an upgrade from a version to itself was accepted");
+        } catch {}
+    }
+
+    /// The developer's knobs are the developer's. All four setters, because access control that is
+    /// tested on two of four is tested on the two someone happened to think of.
+    function _guardStrangerCannotSetKnobs(uint256 mi) private {
+        AppManifest m = manifests[mi];
+
+        vm.prank(STRANGER);
+        try m.setMintAuthorizer(STRANGER) {
+            _bypassed("a stranger seized the mint authorizer");
+        } catch {}
+
+        vm.prank(STRANGER);
+        try m.setBurnOnUpgrade(false) {
+            _bypassed("a stranger changed burnOnUpgrade");
+        } catch {}
+
+        vm.prank(STRANGER);
+        try m.setDowngradesAllowed(true) {
+            _bypassed("a stranger changed downgradesAllowed");
+        } catch {}
+
+        vm.prank(STRANGER);
+        try m.setUpgradePrice(published[mi][0], published[mi][1], 0, true) {
+            _bypassed("a stranger priced a transition");
         } catch {}
     }
 
