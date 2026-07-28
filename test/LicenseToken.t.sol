@@ -48,8 +48,17 @@ contract LicenseTokenTest is Test {
         view
         returns (LicenseToken.MintAuthorization memory)
     {
+        return _auth("", version, to, nonce);
+    }
+
+    function _auth(string memory from, string memory version, address to, uint256 nonce)
+        internal
+        view
+        returns (LicenseToken.MintAuthorization memory)
+    {
         return LicenseToken.MintAuthorization({
             manifest: address(manifest),
+            fromVersion: from,
             version: version,
             to: to,
             nonce: nonce,
@@ -94,7 +103,8 @@ contract LicenseTokenTest is Test {
                 != token.tokenIdFor(address(manifest), "2.0.0")
         );
         assertTrue(
-            token.tokenIdFor(address(manifest), "1.0.0") != token.tokenIdFor(address(other), "1.0.0")
+            token.tokenIdFor(address(manifest), "1.0.0")
+                != token.tokenIdFor(address(other), "1.0.0")
         );
     }
 
@@ -145,6 +155,7 @@ contract LicenseTokenTest is Test {
 
         LicenseToken.MintAuthorization memory auth = LicenseToken.MintAuthorization({
             manifest: address(other),
+            fromVersion: "",
             version: "1.0.0",
             to: holder,
             nonce: 1,
@@ -201,16 +212,29 @@ contract LicenseTokenTest is Test {
 
     /// ADR 0005: the smart-account branch says "not supported", not "invalid signature". Those are
     /// different problems and only one of them is the caller's.
+    /// Reached via a contract *developer*, since the constructor seeds `mintAuthorizer` from it and
+    /// the setter now refuses contracts outright. The branch must still exist and still say "not
+    /// supported" rather than "invalid signature".
     function test_contractAuthorizerIsRejectedExplicitly() public {
-        address contractAuthorizer = address(new ContractAccount());
-        vm.prank(developer);
-        manifest.setMintAuthorizer(contractAuthorizer);
+        address contractDeveloper = address(new ContractAccount());
+        AppManifest contractOwned = new AppManifest(contractDeveloper);
+        vm.prank(contractDeveloper);
+        contractOwned.publishVersion(
+            "1.0.0", IMAGE_DIGEST, COMPOSE_V1, "ipfs://compose-1", 0, bytes32(0), "ipfs://meta-1"
+        );
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", holder, 1);
+        LicenseToken.MintAuthorization memory auth = LicenseToken.MintAuthorization({
+            manifest: address(contractOwned),
+            fromVersion: "",
+            version: "1.0.0",
+            to: holder,
+            nonce: 1,
+            expiry: block.timestamp + 1 hours
+        });
         bytes memory signature = _sign(auth, authorizerKey);
         vm.expectRevert(
             abi.encodeWithSelector(
-                SignatureChecker.SmartAccountNotSupportedInMvp.selector, contractAuthorizer
+                SignatureChecker.SmartAccountNotSupportedInMvp.selector, contractDeveloper
             )
         );
         token.mint(auth, signature);
@@ -243,10 +267,10 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
 
         assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 0);
         assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 1);
@@ -258,10 +282,10 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
 
         uint256 total = token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0"))
             + token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0"));
@@ -277,10 +301,10 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
 
         assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 1);
         assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 1);
@@ -290,25 +314,25 @@ contract LicenseTokenTest is Test {
     /// transition the developer has not priced as permitted does not happen.
     function test_upgradeRequiresAPricedTransition() public {
         _mint("1.0.0", holder, 1);
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         vm.expectRevert(
             abi.encodeWithSelector(LicenseToken.TransitionNotAllowed.selector, "1.0.0", "2.0.0")
         );
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
     }
 
     function test_upgradeRequiresHoldingTheSourceVersion() public {
         _allowTransition("1.0.0", "2.0.0");
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         // Resolved before the prank: `tokenIdFor` is an external call, and it would otherwise be
         // the call the prank applies to.
         uint256 fromTokenId = token.tokenIdFor(address(manifest), "1.0.0");
         vm.prank(holder);
         vm.expectRevert(abi.encodeWithSelector(LicenseToken.NotAHolder.selector, fromTokenId));
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
     }
 
     /// The authorization is the seller's consent to sell, never the holder's consent to give up
@@ -317,7 +341,7 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(relayer);
         vm.expectRevert(
@@ -325,7 +349,7 @@ contract LicenseTokenTest is Test {
                 LicenseToken.RelayedUpgradeNotSupportedInMvp.selector, relayer, holder
             )
         );
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
     }
 
     // — downgrades —
@@ -334,13 +358,13 @@ contract LicenseTokenTest is Test {
         _mint("2.0.0", holder, 1);
         _allowTransition("2.0.0", "1.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", "1.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         vm.expectRevert(
             abi.encodeWithSelector(LicenseToken.DowngradesNotAllowed.selector, "2.0.0", "1.0.0")
         );
-        token.upgrade("2.0.0", auth, signature);
+        token.upgrade(auth, signature);
     }
 
     /// Rollback is the developer's to define (ADR 0004). Note the holder gets the old *version*
@@ -353,10 +377,10 @@ contract LicenseTokenTest is Test {
         _mint("2.0.0", holder, 1);
         _allowTransition("2.0.0", "1.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", "1.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
-        token.upgrade("2.0.0", auth, signature);
+        token.upgrade(auth, signature);
 
         assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 1);
         assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 0);
@@ -376,11 +400,131 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "1.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "1.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         vm.expectRevert(abi.encodeWithSelector(LicenseToken.SameVersion.selector, "1.0.0"));
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
+    }
+
+    // — the two entry points are not interchangeable —
+    //
+    // These exist because an earlier revision let `mint` and `upgrade` consume the same signed
+    // struct, which made every check in `upgrade` decorative. Each test below is an exploit that
+    // worked against that revision.
+
+    /// Burn evasion. The holder pays a discounted upgrade price, then spends the authorization on
+    /// `mint` instead — where `burnOnUpgrade` is never consulted — and keeps both versions. Under
+    /// spec §2.9 that is two concurrent instances bought for one discounted transition.
+    function test_upgradeAuthorizationCannotBeSpentAsAMint() public {
+        _mint("1.0.0", holder, 1);
+        _allowTransition("1.0.0", "2.0.0");
+
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        bytes memory signature = _sign(auth, authorizerKey);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(LicenseToken.UpgradeAuthorizationIsNotAMint.selector, "1.0.0")
+        );
+        token.mint(auth, signature);
+    }
+
+    /// The same bug without holder complicity. The signed pair is public in the mempool the moment
+    /// the holder submits, and `mint` is permissionless, so a bystander front-running it would
+    /// defeat the developer's burn setting on a stranger's behalf.
+    function test_bystanderCannotFrontRunAnUpgradeIntoAMint() public {
+        _mint("1.0.0", holder, 1);
+        _allowTransition("1.0.0", "2.0.0");
+
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        bytes memory signature = _sign(auth, authorizerKey);
+
+        vm.prank(relayer);
+        vm.expectRevert(
+            abi.encodeWithSelector(LicenseToken.UpgradeAuthorizationIsNotAMint.selector, "1.0.0")
+        );
+        token.mint(auth, signature);
+
+        // And the holder's own upgrade still works, because nothing was consumed.
+        vm.prank(holder);
+        token.upgrade(auth, signature);
+        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 1);
+    }
+
+    /// Transition-price arbitrage. `upgradePrice` is directional, so a caller free to choose the
+    /// source pays the cheap recent-holder discount and burns the worthless version instead — the
+    /// signed source is what closes it.
+    function test_holderCannotBurnADifferentVersionThanWasPaidFor() public {
+        _mint("1.0.0", holder, 1);
+        _mint("2.0.0", holder, 2);
+        vm.prank(developer);
+        manifest.publishVersion(
+            "3.0.0", IMAGE_DIGEST, keccak256("c3"), "ipfs://c3", 0, bytes32(0), "ipfs://m3"
+        );
+        // Cheap for recent holders, expensive from the old version. Both permitted.
+        vm.startPrank(developer);
+        manifest.setUpgradePrice("2.0.0", "3.0.0", 1 wei, true);
+        manifest.setUpgradePrice("1.0.0", "3.0.0", 100 ether, true);
+        vm.stopPrank();
+
+        // Authorized for the cheap transition, and it can only spend that one.
+        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", "3.0.0", holder, 3);
+        bytes memory signature = _sign(auth, authorizerKey);
+        vm.prank(holder);
+        token.upgrade(auth, signature);
+
+        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 0);
+        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 1);
+        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "3.0.0")), 1);
+    }
+
+    function test_mintAuthorizationCannotBeSpentAsAnUpgrade() public {
+        _mint("1.0.0", holder, 1);
+        _allowTransition("1.0.0", "2.0.0");
+
+        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", holder, 2);
+        bytes memory signature = _sign(auth, authorizerKey);
+        vm.prank(holder);
+        vm.expectRevert(LicenseToken.MintAuthorizationIsNotAnUpgrade.selector);
+        token.upgrade(auth, signature);
+    }
+
+    /// The signed payload covers the source, so changing it invalidates the signature rather than
+    /// merely being caught by a check that could be reordered away later.
+    function test_tamperingWithTheSourceVersionBreaksTheSignature() public {
+        vm.prank(developer);
+        manifest.publishVersion(
+            "3.0.0", IMAGE_DIGEST, keccak256("c3"), "ipfs://c3", 0, bytes32(0), "ipfs://m3"
+        );
+        _mint("1.0.0", holder, 1);
+        _mint("2.0.0", holder, 2);
+        _allowTransition("1.0.0", "3.0.0");
+        _allowTransition("2.0.0", "3.0.0");
+
+        // Signed for the 1.0.0 source; swapped to a source that would otherwise pass every check
+        // before the signature — it exists, it is held, it is priced, and it is not a downgrade.
+        LicenseToken.MintAuthorization memory signed = _auth("1.0.0", "3.0.0", holder, 3);
+        bytes memory signature = _sign(signed, authorizerKey);
+
+        LicenseToken.MintAuthorization memory tampered = signed;
+        tampered.fromVersion = "2.0.0";
+
+        vm.prank(holder);
+        vm.expectRevert(SignatureChecker.InvalidSignature.selector);
+        token.upgrade(tampered, signature);
+    }
+
+    // — L-2: a delegation that could never work fails where the mistake was made —
+
+    function test_cannotDelegateMintingToAContractAccount() public {
+        address contractAuthorizer = address(new ContractAccount());
+        vm.prank(developer);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                AppManifest.SmartAccountNotSupportedInMvp.selector, contractAuthorizer
+            )
+        );
+        manifest.setMintAuthorizer(contractAuthorizer);
     }
 
     function test_upgradeRejectsNonceReplay() public {
@@ -388,10 +532,10 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 3);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
 
         vm.prank(holder);
         vm.expectRevert(
@@ -399,6 +543,6 @@ contract LicenseTokenTest is Test {
                 LicenseToken.NonceAlreadyUsed.selector, address(manifest), uint256(2)
             )
         );
-        token.upgrade("1.0.0", auth, signature);
+        token.upgrade(auth, signature);
     }
 }

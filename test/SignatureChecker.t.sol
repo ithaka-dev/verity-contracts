@@ -139,10 +139,17 @@ contract SignatureCheckerTest is Test {
     }
 
     function testFuzz_randomBytesNeverVerify(bytes32 digest, bytes32 r, bytes32 s, uint8 v) public {
-        vm.assume(v == 27 || v == 28);
-        vm.assume(
-            uint256(s)
-                <= uint256(0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0)
+        // Bounded rather than assumed. `assume(v == 27 || v == 28)` discards 254 of every 256
+        // inputs and `assume(s <= half order)` another half, which exhausts the fuzzer's rejection
+        // budget long before it finishes — the run fails with "rejected too many inputs" rather
+        // than finding anything. Bounding keeps every generated input useful.
+        v = uint8(bound(v, 27, 28));
+        s = bytes32(
+            bound(
+                uint256(s),
+                1,
+                uint256(0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0)
+            )
         );
         address recovered = ecrecover(digest, v, r, s);
         vm.assume(recovered != signer);

@@ -30,11 +30,30 @@ import {EIP712} from "openzeppelin-contracts/utils/cryptography/EIP712.sol";
 contract LicenseToken is ERC1155, EIP712 {
     using SignatureChecker for address;
 
-    /// @notice A signed statement that someone is entitled to mint one licence.
+    /// @notice A signed statement that someone is entitled to one licence.
     /// @dev Signed by `IAppManifest.mintAuthorizer()` for `manifest` — read from the app's own
     /// contract, never from configuration here.
+    ///
+    /// **`fromVersion` is what distinguishes the two entry points, and it must stay in the signed
+    /// payload.** Empty means a fresh mint; non-empty names the version being transitioned away
+    /// from, and only `upgrade` accepts it.
+    ///
+    /// An earlier revision omitted this, and the omission made every check in `upgrade`
+    /// decorative. If one struct authorizes both operations, an authorization issued for an
+    /// upgrade replays into `mint`, where `burnOnUpgrade`, `downgradesAllowed` and
+    /// `upgradePrice(...).allowed` are simply not consulted: a holder pays a discounted upgrade
+    /// price and keeps both versions, which is two concurrent instances under spec §2.9 for the
+    /// price of one transition. It does not even need the holder's cooperation — the signature is
+    /// public in the mempool, so a bystander can front-run `mint` with it and defeat the
+    /// developer's burn setting on someone else's behalf.
+    ///
+    /// Likewise the transition *source* is signed rather than passed alongside. `upgradePrice` is
+    /// directional by design (ADR 0004), so a caller free to choose `from` picks the cheapest
+    /// priced transition and burns the least valuable thing they hold — paying a recent-holder
+    /// discount while keeping the version that discount was priced against.
     struct MintAuthorization {
         address manifest;
+        string fromVersion;
         string version;
         address to;
         uint256 nonce;
@@ -42,7 +61,7 @@ contract LicenseToken is ERC1155, EIP712 {
     }
 
     bytes32 private constant _MINT_AUTHORIZATION_TYPEHASH = keccak256(
-        "MintAuthorization(address manifest,string version,address to,uint256 nonce,uint256 expiry)"
+        "MintAuthorization(address manifest,string fromVersion,string version,address to,uint256 nonce,uint256 expiry)"
     );
 
     /// @notice What a `tokenId` was derived from.
@@ -66,6 +85,11 @@ contract LicenseToken is ERC1155, EIP712 {
     /// @notice An upgrade was submitted by someone other than the holder.
     /// @dev See `upgrade` for why this is a deliberate MVP boundary rather than an oversight.
     error RelayedUpgradeNotSupportedInMvp(address caller, address holder);
+    /// @notice An authorization naming a `fromVersion` was submitted to `mint`.
+    /// @dev The path that would let a holder keep both versions after paying an upgrade price.
+    error UpgradeAuthorizationIsNotAMint(string fromVersion);
+    /// @notice An authorization with no `fromVersion` was submitted to `upgrade`.
+    error MintAuthorizationIsNotAnUpgrade();
     /// @notice Nothing has ever been minted for this `tokenId`, so there is nothing to resolve.
     error UnknownToken(uint256 tokenId);
 
@@ -106,6 +130,24 @@ contract LicenseToken is ERC1155, EIP712 {
     }
 
     /// @notice What a `tokenId` was derived from, if anything has been minted for it.
+    ///
+    /// @dev **This is a display convenience and never an authority. Do not start a trust decision
+    /// here.**
+    ///
+    /// `auth.manifest` is caller-supplied, so anyone can deploy a contract that answers the
+    /// `IAppManifest` interface, name itself as its own mint authorizer, and mint themselves a
+    /// licence. Inside this contract that is harmless — every `tokenId` is namespaced by the
+    /// manifest address, so a hostile app is confined to ids no real app can occupy, and it cannot
+    /// mint, burn or collide with anyone else's.
+    ///
+    /// The hazard is entirely downstream. A consumer that resolves *`tokenId` → `originOf` →
+    /// manifest → `composeHash`* is reading attacker-authored values out of genuine on-chain
+    /// state — satisfying invariant I3 to the letter while being told what to run by the attacker.
+    ///
+    /// Resolution must run the other way: start from a manifest address the caller already trusts,
+    /// compute `tokenIdFor(manifest, version)`, and check the holder's balance. That direction
+    /// cannot be redirected, because the id is derived from the trusted address rather than
+    /// recovered from an untrusted one.
     function originOf(uint256 tokenId) external view returns (TokenOrigin memory) {
         TokenOrigin memory origin = _origin[tokenId];
         if (origin.manifest == address(0)) revert UnknownToken(tokenId);
@@ -116,6 +158,11 @@ contract LicenseToken is ERC1155, EIP712 {
     /// @dev The manifest is the authority on what a version is, so this contract stores no metadata
     /// of its own and cannot drift from it. A developer publishing a version publishes its metadata
     /// in the same act.
+    ///
+    /// Carries the same caveat as `originOf`: the manifest reached here came from whoever minted
+    /// the token, so the string returned is only as trustworthy as that address. It is also an
+    /// unbounded external call into code the caller did not choose — a hostile manifest can revert
+    /// or return a very large string, which is harmless on chain and worth a timeout off it.
     function uri(uint256 tokenId) public view override returns (string memory) {
         TokenOrigin memory origin = _origin[tokenId];
         if (origin.manifest == address(0)) revert UnknownToken(tokenId);
@@ -135,6 +182,7 @@ contract LicenseToken is ERC1155, EIP712 {
                 abi.encode(
                     _MINT_AUTHORIZATION_TYPEHASH,
                     auth.manifest,
+                    keccak256(bytes(auth.fromVersion)),
                     keccak256(bytes(auth.version)),
                     auth.to,
                     auth.nonce,
@@ -152,7 +200,13 @@ contract LicenseToken is ERC1155, EIP712 {
     /// @notice Mint one licence against an authorization signed by the app's mint authorizer.
     /// @dev Anyone may submit: nothing of the recipient's is consumed, so a relayer paying gas for
     /// a holder is fine here. `upgrade` is different, and says why.
+    ///
+    /// Refuses an authorization that names a `fromVersion`. Without that refusal this function is
+    /// a way to spend an upgrade authorization while skipping everything `upgrade` enforces.
     function mint(MintAuthorization calldata auth, bytes calldata signature) external {
+        if (bytes(auth.fromVersion).length != 0) {
+            revert UpgradeAuthorizationIsNotAMint(auth.fromVersion);
+        }
         _consumeAuthorization(auth, signature);
         uint256 tokenId = _recordOrigin(auth.manifest, auth.version);
         _mint(auth.to, tokenId, 1, "");
@@ -178,13 +232,11 @@ contract LicenseToken is ERC1155, EIP712 {
     /// holder-signed struct, which is deferred with account abstraction (ADR 0002) and rejected
     /// explicitly here rather than approximated (ADR 0005). Note this excludes third-party
     /// relayers, not smart accounts: an ERC-4337 account executing this call *is* `msg.sender`.
-    function upgrade(
-        string calldata from,
-        MintAuthorization calldata auth,
-        bytes calldata signature
-    ) external {
+    function upgrade(MintAuthorization calldata auth, bytes calldata signature) external {
         if (msg.sender != auth.to) revert RelayedUpgradeNotSupportedInMvp(msg.sender, auth.to);
+        if (bytes(auth.fromVersion).length == 0) revert MintAuthorizationIsNotAnUpgrade();
 
+        string calldata from = auth.fromVersion;
         IAppManifest manifest = IAppManifest(auth.manifest);
 
         uint256 fromIndex = manifest.versionIndex(from);
@@ -218,9 +270,12 @@ contract LicenseToken is ERC1155, EIP712 {
     // Internals
     // ---------------------------------------------------------------------------------------
 
-    /// @dev Checks expiry, spends the nonce, then verifies the signature. Spending before verifying
-    /// is deliberate: the nonce is spent for every path that reaches the signature check, so a
-    /// caller cannot probe signatures against a nonce they can keep reusing.
+    /// @dev Checks expiry, marks the nonce, then verifies the signature.
+    ///
+    /// The ordering carries no security weight and should not be read as if it did: a failed
+    /// signature reverts the whole transaction, so the nonce write is rolled back with everything
+    /// else. What actually prevents replay is that a *successful* call persists the mark, and the
+    /// nonce is part of the signed payload.
     function _consumeAuthorization(MintAuthorization calldata auth, bytes calldata signature)
         private
     {

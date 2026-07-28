@@ -32,6 +32,8 @@ contract AppManifest is IAppManifest {
 
     /// @notice Only the developer may write.
     error NotDeveloper(address caller);
+    /// @notice The nominated account is a contract, which cannot sign in MVP.
+    error SmartAccountNotSupportedInMvp(address account);
     /// @notice A version already exists and entries are append-only (I5).
     /// @dev Immutability is the point: a developer must not be able to change what a version means
     /// after someone has licensed it.
@@ -40,6 +42,14 @@ contract AppManifest is IAppManifest {
     error UnknownVersion(string version);
     /// @notice A record field that must be set was zero.
     error EmptyField(string field);
+    /// @notice The only account that may publish versions or set the knobs.
+    /// @dev Immutable, with **no transfer path and no recovery**. Losing this key permanently ends
+    /// the app's ability to publish new versions or change `mintAuthorizer`; already-published
+    /// versions keep working forever, and every existing holder is unaffected.
+    ///
+    /// That follows from ADR 0011 — if the manifest address is the app's identity, a transferable
+    /// developer is a transferable app, and "who may publish as this app" becomes a thing that can
+    /// be sold or stolen. Belongs in developer-facing documentation rather than being discovered.
     address public immutable developer;
 
     /// @notice Whose signature authorizes minting this app's licences. Defaults to the developer.
@@ -79,8 +89,14 @@ contract AppManifest is IAppManifest {
     }
 
     /// @notice Delegate mint authorization to another account, or take it back.
+    /// @dev Rejects a contract account here rather than letting every later mint fail. ADR 0002
+    /// defers ERC-1271, so a developer delegating to a multisig or a contract-based payment service
+    /// would otherwise set this successfully and discover only at the first mint that nothing for
+    /// their app can ever be minted. Failing at the setter puts the error where the mistake was.
+    /// This restriction lifts when ERC-1271 lands in `SignatureChecker`.
     function setMintAuthorizer(address authorizer) external onlyDeveloper {
         if (authorizer == address(0)) revert EmptyField("mintAuthorizer");
+        if (authorizer.code.length > 0) revert SmartAccountNotSupportedInMvp(authorizer);
         mintAuthorizer = authorizer;
         emit MintAuthorizerSet(authorizer);
     }

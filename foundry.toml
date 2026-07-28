@@ -13,6 +13,15 @@ via_ir = false
 # Named gas snapshots so a change in cost is visible in review rather than discovered on-chain.
 gas_reports = ["LicenseToken", "AppManifest", "SignatureChecker"]
 fs_permissions = [{ access = "read", path = "./test/fixtures" }]
+# Local runs are sized to give feedback in seconds; the `ci` profile below is where the depth that
+# actually finds things lives. Deliberately not the other way round — a local suite slow enough to
+# skip is a suite that gets skipped.
+#
+# `depth` is also load-bearing for the vacuity guard in `afterInvariant`, which runs per sequence:
+# with six handler actions, the chance a given run never selects `upgrade` at all is (5/6)^depth, and
+# at depth 32 that is ~0.3% per run — a near-certain flake over a few hundred runs. Depth is what
+# makes "this run exercised the operation" true rather than likely.
+invariant = { runs = 32, depth = 64, fail_on_revert = false }
 
 [fmt]
 line_length = 100
@@ -27,4 +36,4 @@ sort_imports = true
 [profile.ci]
 verbosity = 3
 fuzz = { runs = 4096 }
-invariant = { runs = 512, depth = 32 }
+invariant = { runs = 256, depth = 128, fail_on_revert = false }
