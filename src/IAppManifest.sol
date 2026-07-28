@@ -17,6 +17,14 @@ interface IAppManifest {
         uint256 capabilities;
         bytes32 metadataHash;
         string metadataURI;
+        /// @dev 1-based publication order; 0 means the version does not exist.
+        ///
+        /// Present because "is this transition a downgrade?" has to be answerable on chain, and a
+        /// contract cannot compare version *strings* — `"1.10.0"` sorts below `"1.9.0"` as text, and
+        /// nothing obliges a developer to use semver at all. Publication order is the only ordering
+        /// this contract actually observes, and append-only publishing (I5) makes it monotonic for
+        /// free.
+        uint256 index;
         bool exists;
     }
 
@@ -31,9 +39,21 @@ interface IAppManifest {
     event UpgradePriceSet(string from, string to, uint256 price, bool allowed);
     event BurnOnUpgradeSet(bool burn);
     event DowngradesAllowedSet(bool allowed);
+    event MintAuthorizerSet(address authorizer);
 
     function developer() external view returns (address);
+
+    /// @notice Whose signature `LicenseToken` accepts as authorization to mint this app's licences.
+    /// @dev Read from the app's own manifest rather than configured in the token contract, so a
+    /// developer delegating to a payment service is an on-chain act of theirs — not a setting an
+    /// operator flips. Defaults to the developer.
+    function mintAuthorizer() external view returns (address);
+
     function versionRecord(string calldata version) external view returns (VersionRecord memory);
+
+    /// @notice 1-based publication order, or 0 if the version does not exist.
+    function versionIndex(string calldata version) external view returns (uint256);
+
     function upgradePrice(string calldata from, string calldata to)
         external
         view

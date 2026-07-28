@@ -40,10 +40,16 @@ contract AppManifest is IAppManifest {
     error UnknownVersion(string version);
     /// @notice A record field that must be set was zero.
     error EmptyField(string field);
-    /// @notice A downgrade was priced while downgrades are not permitted.
-    error DowngradesNotAllowed();
-
     address public immutable developer;
+
+    /// @notice Whose signature authorizes minting this app's licences. Defaults to the developer.
+    /// @dev The delegation a developer performs when a payment service mints on their behalf
+    /// (spec §4.2). Kept here rather than in `LicenseToken` so the token contract holds no per-app
+    /// configuration of its own — it reads authority out of the app's own contract, which is what
+    /// keeps "there is no registry" true (ADR 0011).
+    address public mintAuthorizer;
+
+    uint256 private _versionCount;
 
     mapping(bytes32 versionKey => VersionRecord record) private _records;
     mapping(bytes32 transitionKey => uint256 price) private _upgradePrice;
@@ -69,6 +75,14 @@ contract AppManifest is IAppManifest {
     constructor(address developer_) {
         if (developer_ == address(0)) revert EmptyField("developer");
         developer = developer_;
+        mintAuthorizer = developer_;
+    }
+
+    /// @notice Delegate mint authorization to another account, or take it back.
+    function setMintAuthorizer(address authorizer) external onlyDeveloper {
+        if (authorizer == address(0)) revert EmptyField("mintAuthorizer");
+        mintAuthorizer = authorizer;
+        emit MintAuthorizerSet(authorizer);
     }
 
     /// @notice Append a version. Cannot overwrite (I5).
@@ -92,6 +106,7 @@ contract AppManifest is IAppManifest {
         // Without a retrievable compose, a verifier cannot compute the expected measurement at all.
         if (bytes(composeURI).length == 0) revert EmptyField("composeURI");
 
+        _versionCount += 1;
         _records[key] = VersionRecord({
             imageDigest: imageDigest,
             composeHash: composeHash,
@@ -99,6 +114,7 @@ contract AppManifest is IAppManifest {
             capabilities: capabilities,
             metadataHash: metadataHash,
             metadataURI: metadataURI,
+            index: _versionCount,
             exists: true
         });
 
@@ -142,6 +158,16 @@ contract AppManifest is IAppManifest {
     /// @notice Whether a version exists, without reverting.
     function versionExists(string calldata version) external view returns (bool) {
         return _records[_key(version)].exists;
+    }
+
+    /// @inheritdoc IAppManifest
+    function versionIndex(string calldata version) external view returns (uint256) {
+        return _records[_key(version)].index;
+    }
+
+    /// @notice How many versions have been published.
+    function versionCount() external view returns (uint256) {
+        return _versionCount;
     }
 
     /// @inheritdoc IAppManifest
