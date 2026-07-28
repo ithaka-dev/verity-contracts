@@ -53,8 +53,16 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
     mapping(bytes32 versionKey => bytes32 imageDigest) public publishedImageDigest;
     mapping(bytes32 versionKey => string composeURI) public publishedComposeURI;
 
-    mapping(uint256 tokenId => uint256 count) public ghostMinted;
-    mapping(uint256 tokenId => uint256 count) public ghostBurned;
+    mapping(uint256 licenseId => uint256 count) public ghostMinted;
+    mapping(uint256 licenseId => uint256 count) public ghostBurned;
+
+    /// Every licence ever issued, so invariants can iterate real ids rather than deriving them.
+    uint256[] public issued;
+    mapping(uint256 licenseId => uint256 manifestIndex) public licenseManifest;
+
+    function issuedCount() external view returns (uint256) {
+        return issued.length;
+    }
 
     /// @notice Set if an upgrade ever left a holder with a different total than it should have.
     bool public atomicityViolated;
@@ -143,8 +151,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         string memory to = published[mi][toIndex];
 
         address actor = _actor(actorSeed);
-        uint256 fromTokenId = token.tokenIdFor(address(m), from);
-        if (token.balanceOf(actor, fromTokenId) == 0) _mintTo(mi, from, actor);
+        uint256 fromLicenseId = _licenceHeld(mi, from, actor);
 
         (, bool allowed) = m.upgradePrice(from, to);
         if (!allowed) {
@@ -152,24 +159,33 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
             m.setUpgradePrice(from, to, 0, true);
         }
 
-        uint256 toTokenId = token.tokenIdFor(address(m), to);
         bool burns = m.burnOnUpgrade();
-        uint256 totalBefore =
-            token.balanceOf(actor, fromTokenId) + token.balanceOf(actor, toTokenId);
+        uint256 heldBefore = _totalHeld(actor);
 
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, from, to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+            _auth(mi, fromLicenseId, to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
 
         bytes memory signature = _sign(auth);
         vm.prank(actor);
-        token.upgrade(auth, signature);
+        uint256 toLicenseId = token.upgrade(auth, signature);
 
-        ghostMinted[toTokenId]++;
-        if (burns) ghostBurned[fromTokenId]++;
+        ghostMinted[toLicenseId]++;
+        issued.push(toLicenseId);
+        licenseManifest[toLicenseId] = mi;
+        if (burns) ghostBurned[fromLicenseId]++;
         upgradeCount++;
 
-        uint256 totalAfter = token.balanceOf(actor, fromTokenId) + token.balanceOf(actor, toTokenId);
-        if (totalAfter != (burns ? totalBefore : totalBefore + 1)) atomicityViolated = true;
+        // Counted across every licence the actor holds, so a burn that took the wrong unit shows up
+        // as a total that did not move the way it should.
+        uint256 heldAfter = _totalHeld(actor);
+        if (heldAfter != (burns ? heldBefore : heldBefore + 1)) atomicityViolated = true;
+    }
+
+    /// How many licences `actor` holds across every id ever issued.
+    function _totalHeld(address actor) internal view returns (uint256 total) {
+        for (uint256 i = 0; i < issued.length; i++) {
+            total += token.balanceOf(actor, issued[i]);
+        }
     }
 
     function setBurnOnUpgrade(uint256 manifestSeed, bool burn) external {
@@ -188,14 +204,14 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         uint256 mi = _boundManifest(manifestSeed);
         if (published[mi].length == 0) return;
 
-        string memory version = published[mi][_bound(versionSeed, published[mi].length)];
-        uint256 tokenId = token.tokenIdFor(address(manifests[mi]), version);
+        if (issued.length == 0) return;
+        uint256 licenseId = issued[_bound(versionSeed, issued.length)];
         address from = _actor(fromSeed);
         address to = _actor(toSeed);
-        if (from == to || token.balanceOf(from, tokenId) == 0) return;
+        if (from == to || token.balanceOf(from, licenseId) == 0) return;
 
         vm.prank(from);
-        token.safeTransferFrom(from, to, tokenId, 1, "");
+        token.safeTransferFrom(from, to, licenseId, 1, "");
     }
 
     /// @dev Without time moving, an expiry in the past is unreachable and the expiry check is
@@ -221,9 +237,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         string memory from = published[mi][0];
         string memory to = published[mi][1];
 
-        if (token.balanceOf(actor, token.tokenIdFor(address(m), from)) == 0) {
-            _mintTo(mi, from, actor);
-        }
+        uint256 sourceLicense = _licenceHeld(mi, from, actor);
         (, bool allowed) = m.upgradePrice(from, to);
         if (!allowed) {
             vm.prank(developer);
@@ -231,11 +245,12 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         }
         bool burns = m.burnOnUpgrade();
 
-        _guardUpgradeAuthIsNotAMint(mi, from, to, actor, burns);
+        _guardUpgradeAuthIsNotAMint(mi, sourceLicense, to, actor, burns);
         _guardMintAuthIsNotAnUpgrade(mi, to, actor, burns);
         _guardWrongKeyIsRefused(mi, to, actor, burns);
         _guardExpiredIsRefused(mi, to, actor, burns);
         _guardRelayedUpgradeIsRefused(mi, from, to, actor, burns);
+        _guardAnotherHoldersLicenceCannotBeUpgraded(mi, from, to, actor, burns);
         _guardNonceCannotBeReplayed(mi, to, actor, burns);
         _guardUnpublishedVersionCannotMint(mi, actor, burns);
         _guardBurnTermCannotBeFlipped(mi, from, to, actor, burns);
@@ -254,13 +269,13 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
     /// where none of the developer's knobs are consulted.
     function _guardUpgradeAuthIsNotAMint(
         uint256 mi,
-        string memory from,
+        uint256 fromLicenseId,
         string memory to,
         address actor,
         bool burns
     ) private {
         LicenseToken.MintAuthorization memory auth = _auth(
-            mi, from, to, actor, burns, ++nonceCounter, block.timestamp + 1 days
+            mi, fromLicenseId, to, actor, burns, ++nonceCounter, block.timestamp + 1 days
         );
         bytes memory signature = _sign(auth);
         try token.mint(auth, signature) {
@@ -272,7 +287,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         private
     {
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, "", to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+            _auth(mi, 0, to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
         bytes memory signature = _sign(auth);
         vm.prank(actor);
         try token.upgrade(auth, signature) {
@@ -285,7 +300,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         private
     {
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, "", to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+            _auth(mi, 0, to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(STRANGER_KEY, token.hashMintAuthorization(auth));
         try token.mint(auth, abi.encodePacked(r, s, v)) {
             _bypassed("a signature from the wrong key was accepted");
@@ -299,7 +314,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         // forge-lint: disable-next-line(block-timestamp)
         if (block.timestamp == 0) return;
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, "", to, actor, burns, ++nonceCounter, block.timestamp - 1);
+            _auth(mi, 0, to, actor, burns, ++nonceCounter, block.timestamp - 1);
         bytes memory signature = _sign(auth);
         try token.mint(auth, signature) {
             _bypassed("an expired authorization was accepted");
@@ -321,11 +336,9 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         bool burns
     ) private {
         address beneficiary = actor == address(this) ? actors[0] : actor;
-        if (token.balanceOf(address(this), token.tokenIdFor(address(manifests[mi]), from)) == 0) {
-            _mintTo(mi, from, address(this));
-        }
+        uint256 ours = _licenceHeld(mi, from, address(this));
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, from, to, beneficiary, burns, ++nonceCounter, block.timestamp + 1 days);
+            _auth(mi, ours, to, beneficiary, burns, ++nonceCounter, block.timestamp + 1 days);
         bytes memory signature = _sign(auth);
         // No prank: the handler is msg.sender, which is not `auth.to`.
         try token.upgrade(auth, signature) {
@@ -338,11 +351,13 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
     {
         uint256 nonce = ++nonceCounter;
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, "", to, actor, burns, nonce, block.timestamp + 1 days);
+            _auth(mi, 0, to, actor, burns, nonce, block.timestamp + 1 days);
         bytes memory signature = _sign(auth);
 
-        try token.mint(auth, signature) {
-            ghostMinted[token.tokenIdFor(address(manifests[mi]), to)]++;
+        try token.mint(auth, signature) returns (uint256 id) {
+            ghostMinted[id]++;
+            issued.push(id);
+            licenseManifest[id] = mi;
             mintCount++;
         } catch {
             return; // the first mint failed for an unrelated reason; nothing to replay
@@ -354,13 +369,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
 
     function _guardUnpublishedVersionCannotMint(uint256 mi, address actor, bool burns) private {
         LicenseToken.MintAuthorization memory auth = _auth(
-            mi,
-            "",
-            "never-published-version",
-            actor,
-            burns,
-            ++nonceCounter,
-            block.timestamp + 1 days
+            mi, 0, "never-published-version", actor, burns, ++nonceCounter, block.timestamp + 1 days
         );
         bytes memory signature = _sign(auth);
         try token.mint(auth, signature) {
@@ -376,9 +385,9 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         address actor,
         bool burns
     ) private {
-        LicenseToken.MintAuthorization memory auth = _auth(
-            mi, from, to, actor, !burns, ++nonceCounter, block.timestamp + 1 days
-        );
+        uint256 sourceLicense = _licenceHeld(mi, from, actor);
+        LicenseToken.MintAuthorization memory auth =
+            _auth(mi, sourceLicense, to, actor, !burns, ++nonceCounter, block.timestamp + 1 days);
         bytes memory signature = _sign(auth);
         vm.prank(actor);
         try token.upgrade(auth, signature) {
@@ -398,17 +407,16 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         AppManifest m = manifests[mi];
         if (m.downgradesAllowed()) return; // permitted right now; nothing forbidden to attempt
 
-        if (token.balanceOf(actor, token.tokenIdFor(address(m), later)) == 0) {
-            _mintTo(mi, later, actor);
-        }
+        uint256 laterLicense = _licenceHeld(mi, later, actor);
         (, bool allowed) = m.upgradePrice(later, earlier);
         if (!allowed) {
             vm.prank(developer);
             m.setUpgradePrice(later, earlier, 0, true);
         }
 
-        LicenseToken.MintAuthorization memory auth =
-            _auth(mi, later, earlier, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+        LicenseToken.MintAuthorization memory auth = _auth(
+            mi, laterLicense, earlier, actor, burns, ++nonceCounter, block.timestamp + 1 days
+        );
         bytes memory signature = _sign(auth);
         vm.prank(actor);
         try token.upgrade(auth, signature) {
@@ -431,10 +439,12 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
     ) private {
         // A fresh address each time, so it reliably holds nothing.
         address pauper = address(uint160(uint256(keccak256(abi.encode("pauper", nonceCounter)))));
-        if (token.balanceOf(pauper, token.tokenIdFor(address(manifests[mi]), from)) != 0) return;
+        // A licence held by somebody else entirely — the pauper names it and holds none of it.
+        uint256 someoneElses = _licenceHeld(mi, from, actors[0]);
+        if (token.balanceOf(pauper, someoneElses) != 0) return;
 
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, from, to, pauper, burns, ++nonceCounter, block.timestamp + 1 days);
+            _auth(mi, someoneElses, to, pauper, burns, ++nonceCounter, block.timestamp + 1 days);
         bytes memory signature = _sign(auth);
         vm.prank(pauper);
         try token.upgrade(auth, signature) {
@@ -455,11 +465,9 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         (, bool allowed) = m.upgradePrice(from, to);
         if (allowed) return; // already permitted; nothing forbidden to attempt
 
-        if (token.balanceOf(actor, token.tokenIdFor(address(m), from)) == 0) {
-            _mintTo(mi, from, actor);
-        }
+        uint256 sourceLicense = _licenceHeld(mi, from, actor);
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, from, to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+            _auth(mi, sourceLicense, to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
         bytes memory signature = _sign(auth);
         vm.prank(actor);
         try token.upgrade(auth, signature) {
@@ -479,11 +487,9 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
             vm.prank(developer);
             m.setUpgradePrice(version, version, 0, true);
         }
-        if (token.balanceOf(actor, token.tokenIdFor(address(m), version)) == 0) {
-            _mintTo(mi, version, actor);
-        }
+        uint256 licenseId = _licenceHeld(mi, version, actor);
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, version, version, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+            _auth(mi, licenseId, version, actor, burns, ++nonceCounter, block.timestamp + 1 days);
         bytes memory signature = _sign(auth);
         vm.prank(actor);
         try token.upgrade(auth, signature) {
@@ -514,6 +520,33 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         vm.prank(STRANGER);
         try m.setUpgradePrice(published[mi][0], published[mi][1], 0, true) {
             _bypassed("a stranger priced a transition");
+        } catch {}
+    }
+
+    /// **The guard ADR 0023 exists for.** A holder of the same version must not be able to act on
+    /// somebody else's licence. Under per-version ids this succeeded: the balance check established
+    /// only that the caller was a customer of that version.
+    function _guardAnotherHoldersLicenceCannotBeUpgraded(
+        uint256 mi,
+        string memory from,
+        string memory to,
+        address actor,
+        bool burns
+    ) private {
+        address other = actor == actors[0] ? actors[1] : actors[0];
+        uint256 theirs = _licenceHeld(mi, from, other);
+        if (token.balanceOf(actor, theirs) != 0) return; // same holder; nothing to attempt
+
+        // `actor` genuinely holds a licence for this version — they are a paying customer — and
+        // names somebody else's unit.
+        _licenceHeld(mi, from, actor);
+
+        LicenseToken.MintAuthorization memory auth =
+            _auth(mi, theirs, to, actor, burns, ++nonceCounter, block.timestamp + 1 days);
+        bytes memory signature = _sign(auth);
+        vm.prank(actor);
+        try token.upgrade(auth, signature) {
+            _bypassed("a holder upgraded another holder's licence");
         } catch {}
     }
 
@@ -601,17 +634,35 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         publishCount++;
     }
 
-    function _mintTo(uint256 mi, string memory version, address to) internal {
+    function _mintTo(uint256 mi, string memory version, address to) internal returns (uint256 id) {
         LicenseToken.MintAuthorization memory auth =
-            _auth(mi, "", version, to, false, ++nonceCounter, block.timestamp + 1 days);
-        token.mint(auth, _sign(auth));
-        ghostMinted[token.tokenIdFor(address(manifests[mi]), version)]++;
+            _auth(mi, 0, version, to, false, ++nonceCounter, block.timestamp + 1 days);
+        id = token.mint(auth, _sign(auth));
+        ghostMinted[id]++;
+        issued.push(id);
+        licenseManifest[id] = mi;
         mintCount++;
+    }
+
+    /// A licence `actor` currently holds for `version`, minting one if they hold none.
+    function _licenceHeld(uint256 mi, string memory version, address actor)
+        internal
+        returns (uint256)
+    {
+        for (uint256 i = 0; i < issued.length; i++) {
+            uint256 id = issued[i];
+            if (licenseManifest[id] != mi) continue;
+            if (token.balanceOf(actor, id) == 0) continue;
+            if (keccak256(bytes(token.originOf(id).version)) == keccak256(bytes(version))) {
+                return id;
+            }
+        }
+        return _mintTo(mi, version, actor);
     }
 
     function _auth(
         uint256 mi,
-        string memory fromVersion,
+        uint256 fromLicenseId,
         string memory version,
         address to,
         bool burnExpected,
@@ -620,7 +671,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
     ) internal view returns (LicenseToken.MintAuthorization memory) {
         return LicenseToken.MintAuthorization({
             manifest: address(manifests[mi]),
-            fromVersion: fromVersion,
+            fromLicenseId: fromLicenseId,
             version: version,
             to: to,
             burnExpected: burnExpected,

@@ -92,7 +92,7 @@ contract AppManifestFactoryTest is Test {
 
             LicenseToken.MintAuthorization memory auth = LicenseToken.MintAuthorization({
                 manifest: address(m),
-                fromVersion: "",
+                fromLicenseId: 0,
                 version: "1.0.0",
                 to: outsider,
                 burnExpected: false,
@@ -101,9 +101,9 @@ contract AppManifestFactoryTest is Test {
             });
             (uint8 v, bytes32 r, bytes32 s) =
                 vm.sign(authorizerKey, token.hashMintAuthorization(auth));
-            token.mint(auth, abi.encodePacked(r, s, v));
+            uint256 licenseId = token.mint(auth, abi.encodePacked(r, s, v));
 
-            assertEq(token.balanceOf(outsider, token.tokenIdFor(address(m), "1.0.0")), 1);
+            assertEq(token.balanceOf(outsider, licenseId), 1);
         }
     }
 

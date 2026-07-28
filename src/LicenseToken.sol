@@ -34,9 +34,15 @@ contract LicenseToken is ERC1155, EIP712 {
     /// @dev Signed by `IAppManifest.mintAuthorizer()` for `manifest` — read from the app's own
     /// contract, never from configuration here.
     ///
-    /// **`fromVersion` is what distinguishes the two entry points, and it must stay in the signed
-    /// payload.** Empty means a fresh mint; non-empty names the version being transitioned away
-    /// from, and only `upgrade` accepts it.
+    /// **`fromLicenseId` is what distinguishes the two entry points, and it must stay in the signed
+    /// payload.** Zero means a fresh mint; non-zero names the *specific licence* being transitioned
+    /// away from, and only `upgrade` accepts it.
+    ///
+    /// It names a licence rather than a version because licences are per-unit (ADR 0023). An
+    /// earlier revision named the version, which under fungible per-version ids meant "any unit of
+    /// that version the caller happens to hold" — and that ambiguity ran all the way out to the app
+    /// template, where a holder check could only establish that the signer was *a customer of this
+    /// version*, never that they owned *this instance*.
     ///
     /// An earlier revision omitted this, and the omission made every check in `upgrade`
     /// decorative. If one struct authorizes both operations, an authorization issued for an
@@ -53,7 +59,7 @@ contract LicenseToken is ERC1155, EIP712 {
     /// discount while keeping the version that discount was priced against.
     struct MintAuthorization {
         address manifest;
-        string fromVersion;
+        uint256 fromLicenseId;
         string version;
         address to;
         bool burnExpected;
@@ -62,7 +68,7 @@ contract LicenseToken is ERC1155, EIP712 {
     }
 
     bytes32 private constant _MINT_AUTHORIZATION_TYPEHASH = keccak256(
-        "MintAuthorization(address manifest,string fromVersion,string version,address to,bool burnExpected,uint256 nonce,uint256 expiry)"
+        "MintAuthorization(address manifest,uint256 fromLicenseId,string version,address to,bool burnExpected,uint256 nonce,uint256 expiry)"
     );
 
     /// @notice What a `tokenId` was derived from.
@@ -75,8 +81,10 @@ contract LicenseToken is ERC1155, EIP712 {
     error AuthorizationExpired(uint256 expiry, uint256 blockTimestamp);
     /// @notice This `(manifest, nonce)` pair has already been used.
     error NonceAlreadyUsed(address manifest, uint256 nonce);
-    /// @notice The caller holds none of the version it is trying to upgrade from.
-    error NotAHolder(uint256 tokenId);
+    /// @notice The caller does not hold the specific licence it is trying to upgrade.
+    /// @dev A licence is one indivisible unit (ADR 0023), so this is ownership of *that* licence
+    /// and not membership of the set of people holding that version.
+    error NotAHolder(uint256 licenseId);
     /// @notice The developer has not priced this transition as permitted.
     error TransitionNotAllowed(string from, string to);
     /// @notice The transition moves to an earlier version and the developer forbids that.
@@ -86,9 +94,11 @@ contract LicenseToken is ERC1155, EIP712 {
     /// @notice An upgrade was submitted by someone other than the holder.
     /// @dev See `upgrade` for why this is a deliberate MVP boundary rather than an oversight.
     error RelayedUpgradeNotSupportedInMvp(address caller, address holder);
-    /// @notice An authorization naming a `fromVersion` was submitted to `mint`.
+    /// @notice An authorization naming a `fromLicenseId` was submitted to `mint`.
     /// @dev The path that would let a holder keep both versions after paying an upgrade price.
-    error UpgradeAuthorizationIsNotAMint(string fromVersion);
+    error UpgradeAuthorizationIsNotAMint(uint256 fromLicenseId);
+    /// @notice The licence named by the authorization does not exist.
+    error UnknownLicense(uint256 licenseId);
     /// @notice An authorization with no `fromVersion` was submitted to `upgrade`.
     error MintAuthorizationIsNotAnUpgrade();
     /// @notice The developer changed the burn term after this authorization was signed.
@@ -115,7 +125,9 @@ contract LicenseToken is ERC1155, EIP712 {
         bool burned
     );
 
-    mapping(uint256 tokenId => TokenOrigin origin) private _origin;
+    mapping(uint256 licenseId => TokenOrigin origin) private _origin;
+    /// @dev Per-version mint counter. The next licence's serial is this plus one.
+    mapping(uint256 versionId => uint256 minted) private _serial;
     mapping(address manifest => mapping(uint256 nonce => bool used)) private _nonceUsed;
 
     /// @dev The base URI is empty on purpose: `uri()` is overridden to resolve through to the
@@ -126,16 +138,43 @@ contract LicenseToken is ERC1155, EIP712 {
     // Identity
     // ---------------------------------------------------------------------------------------
 
-    /// @notice The `tokenId` for a version of an app.
-    /// @dev `abi.encode` over `(address, bytes32)`, both fixed-width.
+    /// @notice The identifier for a *version* of an app. Groups licences; is not one itself.
     ///
-    /// `abi.encodePacked` would in fact be injective *here* — a 20-byte address prefix followed by
-    /// a 32-byte hash cannot be re-split — so this is not fixing a live collision. It is chosen
-    /// because the packed form stops being injective the moment a second variable-width field is
-    /// added, and that edit would look harmless. A collision in this function means one app's
-    /// licence entitles a holder to run another's.
-    function tokenIdFor(address manifest, string memory version) public pure returns (uint256) {
+    /// @dev Kept as a pure function because it is what an off-chain reader uses to ask "which
+    /// version is this licence for" without consulting any registry. **It is not a `tokenId`** —
+    /// nothing is ever minted against it. That distinction is the whole of ADR 0023: an ERC-1155
+    /// balance of a per-version id says only *"this address is a customer of this version"*, and a
+    /// system that needs to know *"this address owns this instance"* cannot be built on it.
+    ///
+    /// `abi.encode` over `(address, bytes32)`, both fixed-width. `abi.encodePacked` would in fact
+    /// be injective here — a 20-byte address prefix followed by a 32-byte hash cannot be re-split —
+    /// so this is not fixing a live collision. It is chosen because the packed form stops being
+    /// injective the moment a second variable-width field is added, and that edit would look
+    /// harmless.
+    function versionIdFor(address manifest, string memory version) public pure returns (uint256) {
         return uint256(keccak256(abi.encode(manifest, keccak256(bytes(version)))));
+    }
+
+    /// @notice The identifier of the `serial`-th licence minted for a version.
+    ///
+    /// @dev Deterministic, so a holder can recompute their own licence id from the mint event, and
+    /// distinct per unit, so `balanceOf(holder, licenseId)` answers ownership of one specific
+    /// entitlement rather than membership of a crowd. Every licence has a balance of exactly 1.
+    function licenseIdFor(address manifest, string memory version, uint256 serial)
+        public
+        pure
+        returns (uint256)
+    {
+        return uint256(keccak256(abi.encode(manifest, keccak256(bytes(version)), serial)));
+    }
+
+    /// @notice How many licences have been minted for a version. The next serial is this plus one.
+    function mintedCount(address manifest, string calldata version)
+        external
+        view
+        returns (uint256)
+    {
+        return _serial[versionIdFor(manifest, version)];
     }
 
     /// @notice What a `tokenId` was derived from, if anything has been minted for it.
@@ -191,7 +230,7 @@ contract LicenseToken is ERC1155, EIP712 {
                 abi.encode(
                     _MINT_AUTHORIZATION_TYPEHASH,
                     auth.manifest,
-                    keccak256(bytes(auth.fromVersion)),
+                    auth.fromLicenseId,
                     keccak256(bytes(auth.version)),
                     auth.to,
                     auth.burnExpected,
@@ -218,14 +257,16 @@ contract LicenseToken is ERC1155, EIP712 {
     ///
     /// Refuses an authorization that names a `fromVersion`. Without that refusal this function is
     /// a way to spend an upgrade authorization while skipping everything `upgrade` enforces.
-    function mint(MintAuthorization calldata auth, bytes calldata signature) external {
-        if (bytes(auth.fromVersion).length != 0) {
-            revert UpgradeAuthorizationIsNotAMint(auth.fromVersion);
+    function mint(MintAuthorization calldata auth, bytes calldata signature)
+        external
+        returns (uint256 licenseId)
+    {
+        if (auth.fromLicenseId != 0) {
+            revert UpgradeAuthorizationIsNotAMint(auth.fromLicenseId);
         }
         _consumeAuthorization(auth, signature);
-        uint256 tokenId = _recordOrigin(auth.manifest, auth.version);
-        _mint(auth.to, tokenId, 1, "");
-        emit LicenseMinted(tokenId, auth.to, auth.manifest, auth.version);
+        licenseId = _issue(auth.manifest, auth.version, auth.to);
+        emit LicenseMinted(licenseId, auth.to, auth.manifest, auth.version);
     }
 
     /// @notice Move a holder from one version to another: burn the old entitlement and mint the new
@@ -247,11 +288,23 @@ contract LicenseToken is ERC1155, EIP712 {
     /// holder-signed struct, which is deferred with account abstraction (ADR 0002) and rejected
     /// explicitly here rather than approximated (ADR 0005). Note this excludes third-party
     /// relayers, not smart accounts: an ERC-4337 account executing this call *is* `msg.sender`.
-    function upgrade(MintAuthorization calldata auth, bytes calldata signature) external {
-        if (msg.sender != auth.to) revert RelayedUpgradeNotSupportedInMvp(msg.sender, auth.to);
-        if (bytes(auth.fromVersion).length == 0) revert MintAuthorizationIsNotAnUpgrade();
+    function upgrade(MintAuthorization calldata auth, bytes calldata signature)
+        external
+        returns (uint256 licenseId)
+    {
+        if (msg.sender != auth.to) {
+            revert RelayedUpgradeNotSupportedInMvp(msg.sender, auth.to);
+        }
+        if (auth.fromLicenseId == 0) revert MintAuthorizationIsNotAnUpgrade();
 
-        string calldata from = auth.fromVersion;
+        // The source version comes from the licence being consumed, not from the message. A caller
+        // cannot name one version and burn a licence for another, because there is only one licence
+        // in play and it knows what it is.
+        TokenOrigin memory source = _origin[auth.fromLicenseId];
+        if (source.manifest == address(0)) revert UnknownLicense(auth.fromLicenseId);
+        if (source.manifest != auth.manifest) revert UnknownLicense(auth.fromLicenseId);
+        string memory from = source.version;
+
         IAppManifest manifest = IAppManifest(auth.manifest);
 
         uint256 fromIndex = manifest.versionIndex(from);
@@ -265,8 +318,9 @@ contract LicenseToken is ERC1155, EIP712 {
         (, bool allowed) = manifest.upgradePrice(from, auth.version);
         if (!allowed) revert TransitionNotAllowed(from, auth.version);
 
-        uint256 fromTokenId = tokenIdFor(auth.manifest, from);
-        if (balanceOf(msg.sender, fromTokenId) == 0) revert NotAHolder(fromTokenId);
+        // Ownership of *this* licence, not of the version. Under the previous per-version ids this
+        // check passed for anyone holding any unit of that version (ADR 0023).
+        if (balanceOf(msg.sender, auth.fromLicenseId) == 0) revert NotAHolder(auth.fromLicenseId);
 
         _consumeAuthorization(auth, signature);
 
@@ -281,13 +335,12 @@ contract LicenseToken is ERC1155, EIP712 {
         bool burned = manifest.burnOnUpgrade();
         if (burned != auth.burnExpected) revert BurnTermChanged(auth.burnExpected, burned);
         if (burned) {
-            _burn(msg.sender, fromTokenId, 1);
+            _burn(msg.sender, auth.fromLicenseId, 1);
         }
 
-        uint256 toTokenId = _recordOrigin(auth.manifest, auth.version);
-        _mint(msg.sender, toTokenId, 1, "");
+        licenseId = _issue(auth.manifest, auth.version, msg.sender);
 
-        emit LicenseUpgraded(msg.sender, auth.manifest, fromTokenId, toTokenId, burned);
+        emit LicenseUpgraded(msg.sender, auth.manifest, auth.fromLicenseId, licenseId, burned);
     }
 
     // ---------------------------------------------------------------------------------------
@@ -324,18 +377,28 @@ contract LicenseToken is ERC1155, EIP712 {
         authorizer.requireValidSignature(hashMintAuthorization(auth), signature);
     }
 
-    /// @dev Resolves the version against the manifest — which reverts for an unknown one, so a
-    /// licence can never be minted for a version that was never published — and remembers the
-    /// derivation the first time a `tokenId` is used.
-    function _recordOrigin(address manifest, string calldata version)
+    /// @dev Mint one new, uniquely-identified licence.
+    ///
+    /// Resolves the version against the manifest first — which reverts for an unknown one, so a
+    /// licence can never exist for a version that was never published — then allocates the next
+    /// serial and records what the id was derived from.
+    ///
+    /// Every licence has a balance of exactly 1. That is what makes `balanceOf(holder, licenseId)`
+    /// an ownership question rather than a membership one.
+    function _issue(address manifest, string calldata version, address to)
         private
-        returns (uint256 tokenId)
+        returns (uint256 licenseId)
     {
         IAppManifest.VersionRecord memory record = IAppManifest(manifest).versionRecord(version);
-        tokenId = tokenIdFor(manifest, version);
-        if (_origin[tokenId].manifest == address(0)) {
-            _origin[tokenId] = TokenOrigin({manifest: manifest, version: version});
-            emit TokenOriginRecorded(tokenId, manifest, version, record.composeHash);
-        }
+
+        uint256 versionId = versionIdFor(manifest, version);
+        uint256 serial = _serial[versionId] + 1;
+        _serial[versionId] = serial;
+
+        licenseId = licenseIdFor(manifest, version, serial);
+        _origin[licenseId] = TokenOrigin({manifest: manifest, version: version});
+        emit TokenOriginRecorded(licenseId, manifest, version, record.composeHash);
+
+        _mint(to, licenseId, 1, "");
     }
 }

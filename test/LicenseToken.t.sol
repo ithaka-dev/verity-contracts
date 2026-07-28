@@ -48,10 +48,10 @@ contract LicenseTokenTest is Test {
         view
         returns (LicenseToken.MintAuthorization memory)
     {
-        return _auth("", version, to, nonce);
+        return _auth(0, version, to, nonce);
     }
 
-    function _auth(string memory from, string memory version, address to, uint256 nonce)
+    function _auth(uint256 fromLicenseId, string memory version, address to, uint256 nonce)
         internal
         view
         returns (LicenseToken.MintAuthorization memory)
@@ -60,7 +60,7 @@ contract LicenseTokenTest is Test {
         // service would do at the moment it charged.
         return LicenseToken.MintAuthorization({
             manifest: address(manifest),
-            fromVersion: from,
+            fromLicenseId: fromLicenseId,
             version: version,
             to: to,
             burnExpected: manifest.burnOnUpgrade(),
@@ -78,9 +78,14 @@ contract LicenseTokenTest is Test {
         return abi.encodePacked(r, s, v);
     }
 
-    function _mint(string memory version, address to, uint256 nonce) internal {
+    function _mint(string memory version, address to, uint256 nonce) internal returns (uint256) {
         LicenseToken.MintAuthorization memory auth = _auth(version, to, nonce);
-        token.mint(auth, _sign(auth, authorizerKey));
+        return token.mint(auth, _sign(auth, authorizerKey));
+    }
+
+    /// The `serial`-th licence minted for `version` of this app.
+    function _lic(string memory version, uint256 serial) internal view returns (uint256) {
+        return token.licenseIdFor(address(manifest), version, serial);
     }
 
     function _allowTransition(string memory from, string memory to) internal {
@@ -90,24 +95,45 @@ contract LicenseTokenTest is Test {
 
     // — C-08: the tokenId scheme —
 
-    /// The property that makes "no registry" true: a tokenId is computable by anyone, offline,
+    /// The property that makes "no registry" true: a version id is computable by anyone, offline,
     /// from an address and a string. Nothing has to be written anywhere first.
-    function test_tokenIdIsPureDerivation() public view {
+    function test_versionIdIsPureDerivation() public view {
         assertEq(
-            token.tokenIdFor(address(manifest), "1.0.0"),
+            token.versionIdFor(address(manifest), "1.0.0"),
             uint256(keccak256(abi.encode(address(manifest), keccak256(bytes("1.0.0")))))
         );
     }
 
-    function test_tokenIdDiffersByVersionAndByApp() public {
+    /// **The property ADR 0023 exists for.** Two holders of the same version hold *different*
+    /// licences, so `balanceOf(holder, licenseId)` asks who owns one specific entitlement. Under
+    /// the previous per-version ids it asked only whether someone was a customer of that version —
+    /// which let any holder of a version act on any other holder's instance.
+    function test_eachLicenceIsADistinctUnit() public {
+        uint256 first = _mint("1.0.0", holder, 1);
+        uint256 second = _mint("1.0.0", relayer, 2);
+
+        assertTrue(first != second, "two licences for one version must not share an id");
+        assertEq(token.balanceOf(holder, first), 1);
+        assertEq(token.balanceOf(holder, second), 0, "holder must not hold the other's licence");
+        assertEq(token.balanceOf(relayer, second), 1);
+        assertEq(token.balanceOf(relayer, first), 0);
+    }
+
+    function test_licenceIdsAreDerivableFromTheSerial() public {
+        assertEq(_mint("1.0.0", holder, 1), _lic("1.0.0", 1));
+        assertEq(_mint("1.0.0", holder, 2), _lic("1.0.0", 2));
+        assertEq(token.mintedCount(address(manifest), "1.0.0"), 2);
+    }
+
+    function test_versionIdDiffersByVersionAndByApp() public {
         AppManifest other = new AppManifest(developer);
         assertTrue(
-            token.tokenIdFor(address(manifest), "1.0.0")
-                != token.tokenIdFor(address(manifest), "2.0.0")
+            token.versionIdFor(address(manifest), "1.0.0")
+                != token.versionIdFor(address(manifest), "2.0.0")
         );
         assertTrue(
-            token.tokenIdFor(address(manifest), "1.0.0")
-                != token.tokenIdFor(address(other), "1.0.0")
+            token.versionIdFor(address(manifest), "1.0.0")
+                != token.versionIdFor(address(other), "1.0.0")
         );
     }
 
@@ -116,19 +142,31 @@ contract LicenseTokenTest is Test {
     /// entitle a holder to run another's.
     function test_adjacentVersionStringsDoNotCollide() public view {
         assertTrue(
-            token.tokenIdFor(address(manifest), "1.0") != token.tokenIdFor(address(manifest), "10")
+            token.versionIdFor(address(manifest), "1.0")
+                != token.versionIdFor(address(manifest), "10")
         );
     }
 
-    function testFuzz_tokenIdIsDeterministic(address app, string calldata version) public view {
-        assertEq(token.tokenIdFor(app, version), token.tokenIdFor(app, version));
+    function testFuzz_versionIdIsDeterministic(address app, string calldata version) public view {
+        assertEq(token.versionIdFor(app, version), token.versionIdFor(app, version));
+    }
+
+    /// Nothing is ever minted against a version id, so it must never collide with a licence id.
+    function testFuzz_versionIdsAndLicenceIdsAreDisjoint(string calldata version, uint256 serial)
+        public
+        view
+    {
+        assertTrue(
+            token.versionIdFor(address(manifest), version)
+                != token.licenseIdFor(address(manifest), version, serial)
+        );
     }
 
     // — C-10: mint authorization —
 
     function test_mintWithValidAuthorization() public {
-        _mint("1.0.0", holder, 1);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 1);
+        uint256 licenseId = _mint("1.0.0", holder, 1);
+        assertEq(token.balanceOf(holder, licenseId), 1);
     }
 
     /// Nothing of the recipient's is consumed by a mint, so a relayer paying gas is legitimate.
@@ -136,8 +174,8 @@ contract LicenseTokenTest is Test {
         LicenseToken.MintAuthorization memory auth = _auth("1.0.0", holder, 1);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(relayer);
-        token.mint(auth, signature);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 1);
+        uint256 licenseId = token.mint(auth, signature);
+        assertEq(token.balanceOf(holder, licenseId), 1);
     }
 
     function test_mintRejectsWrongSigner() public {
@@ -158,7 +196,7 @@ contract LicenseTokenTest is Test {
 
         LicenseToken.MintAuthorization memory auth = LicenseToken.MintAuthorization({
             manifest: address(other),
-            fromVersion: "",
+            fromLicenseId: 0,
             version: "1.0.0",
             to: holder,
             burnExpected: false,
@@ -200,9 +238,12 @@ contract LicenseTokenTest is Test {
     /// Nonces are arbitrary rather than sequential, so a payment service can issue authorizations
     /// concurrently without serialising them behind a counter.
     function test_noncesNeedNoOrdering() public {
-        _mint("1.0.0", holder, 99);
-        _mint("1.0.0", holder, 2);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 2);
+        uint256 a = _mint("1.0.0", holder, 99);
+        uint256 b = _mint("1.0.0", holder, 2);
+        // Two runnable instances under §2.9 — and now two distinguishable entitlements, so an
+        // authorization can name which one it acts on.
+        assertEq(token.balanceOf(holder, a), 1);
+        assertEq(token.balanceOf(holder, b), 1);
     }
 
     /// A licence cannot exist for a version that was never published — the manifest is asked, and it
@@ -229,7 +270,7 @@ contract LicenseTokenTest is Test {
 
         LicenseToken.MintAuthorization memory auth = LicenseToken.MintAuthorization({
             manifest: address(contractOwned),
-            fromVersion: "",
+            fromLicenseId: 0,
             version: "1.0.0",
             to: holder,
             burnExpected: false,
@@ -248,19 +289,18 @@ contract LicenseTokenTest is Test {
 
     function test_uriResolvesThroughToManifestMetadata() public {
         _mint("1.0.0", holder, 1);
-        assertEq(token.uri(token.tokenIdFor(address(manifest), "1.0.0")), "ipfs://meta-1");
+        assertEq(token.uri(_lic("1.0.0", 1)), "ipfs://meta-1");
     }
 
     function test_uriRevertsForATokenNeverMinted() public {
-        uint256 tokenId = token.tokenIdFor(address(manifest), "2.0.0");
+        uint256 tokenId = _lic("2.0.0", 1);
         vm.expectRevert(abi.encodeWithSelector(LicenseToken.UnknownToken.selector, tokenId));
         token.uri(tokenId);
     }
 
     function test_originRecordsTheDerivation() public {
         _mint("1.0.0", holder, 1);
-        LicenseToken.TokenOrigin memory origin =
-            token.originOf(token.tokenIdFor(address(manifest), "1.0.0"));
+        LicenseToken.TokenOrigin memory origin = token.originOf(_lic("1.0.0", 1));
         assertEq(origin.manifest, address(manifest));
         assertEq(origin.version, "1.0.0");
     }
@@ -271,13 +311,13 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         token.upgrade(auth, signature);
 
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 0);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 1);
+        assertEq(token.balanceOf(holder, _lic("1.0.0", 1)), 0);
+        assertEq(token.balanceOf(holder, _lic("2.0.0", 1)), 1);
     }
 
     /// ADR 0008: there is no two-instance window, so §2.9 needs no exemption. Asserted by checking
@@ -286,13 +326,13 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         token.upgrade(auth, signature);
 
-        uint256 total = token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0"))
-            + token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0"));
+        uint256 total =
+            token.balanceOf(holder, _lic("1.0.0", 1)) + token.balanceOf(holder, _lic("2.0.0", 1));
         assertEq(total, 1);
     }
 
@@ -305,20 +345,20 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         token.upgrade(auth, signature);
 
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 1);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 1);
+        assertEq(token.balanceOf(holder, _lic("1.0.0", 1)), 1);
+        assertEq(token.balanceOf(holder, _lic("2.0.0", 1)), 1);
     }
 
     /// Doing nothing keeps a holder on the digest they licensed, indefinitely (ADR 0003). A
     /// transition the developer has not priced as permitted does not happen.
     function test_upgradeRequiresAPricedTransition() public {
         _mint("1.0.0", holder, 1);
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         vm.expectRevert(
@@ -327,15 +367,32 @@ contract LicenseTokenTest is Test {
         token.upgrade(auth, signature);
     }
 
-    function test_upgradeRequiresHoldingTheSourceVersion() public {
+    /// **The property ADR 0023 exists for.** `relayer` is a genuine paying customer of 1.0.0 — they
+    /// hold their own licence for it — and names the licence belonging to `holder`. Under the
+    /// previous per-version ids this succeeded, because the balance check established only that the
+    /// caller was a customer of that version.
+    function test_aHolderCannotUpgradeAnotherHoldersLicence() public {
+        uint256 theirs = _mint("1.0.0", holder, 1);
+        _mint("1.0.0", relayer, 2); // the attacker is a real customer of the same version
         _allowTransition("1.0.0", "2.0.0");
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+
+        LicenseToken.MintAuthorization memory auth = _auth(theirs, "2.0.0", relayer, 3);
         bytes memory signature = _sign(auth, authorizerKey);
-        // Resolved before the prank: `tokenIdFor` is an external call, and it would otherwise be
-        // the call the prank applies to.
-        uint256 fromTokenId = token.tokenIdFor(address(manifest), "1.0.0");
+
+        vm.prank(relayer);
+        vm.expectRevert(abi.encodeWithSelector(LicenseToken.NotAHolder.selector, theirs));
+        token.upgrade(auth, signature);
+
+        assertEq(token.balanceOf(holder, theirs), 1, "the victim keeps their licence");
+    }
+
+    function test_upgradeRequiresAnExistingLicence() public {
+        _allowTransition("1.0.0", "2.0.0");
+        uint256 neverMinted = _lic("1.0.0", 99);
+        LicenseToken.MintAuthorization memory auth = _auth(neverMinted, "2.0.0", holder, 2);
+        bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
-        vm.expectRevert(abi.encodeWithSelector(LicenseToken.NotAHolder.selector, fromTokenId));
+        vm.expectRevert(abi.encodeWithSelector(LicenseToken.UnknownLicense.selector, neverMinted));
         token.upgrade(auth, signature);
     }
 
@@ -345,7 +402,7 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(relayer);
         vm.expectRevert(
@@ -362,7 +419,7 @@ contract LicenseTokenTest is Test {
         _mint("2.0.0", holder, 1);
         _allowTransition("2.0.0", "1.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", "1.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("2.0.0", 1), "1.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         vm.expectRevert(
@@ -381,13 +438,13 @@ contract LicenseTokenTest is Test {
         _mint("2.0.0", holder, 1);
         _allowTransition("2.0.0", "1.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", "1.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("2.0.0", 1), "1.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         token.upgrade(auth, signature);
 
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 1);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 0);
+        assertEq(token.balanceOf(holder, _lic("1.0.0", 1)), 1);
+        assertEq(token.balanceOf(holder, _lic("2.0.0", 1)), 0);
     }
 
     /// Ordering comes from publication order, not from parsing the string — `"1.10.0"` sorts below
@@ -404,7 +461,7 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "1.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "1.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "1.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         vm.expectRevert(abi.encodeWithSelector(LicenseToken.SameVersion.selector, "1.0.0"));
@@ -424,11 +481,13 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
 
         vm.expectRevert(
-            abi.encodeWithSelector(LicenseToken.UpgradeAuthorizationIsNotAMint.selector, "1.0.0")
+            abi.encodeWithSelector(
+                LicenseToken.UpgradeAuthorizationIsNotAMint.selector, _lic("1.0.0", 1)
+            )
         );
         token.mint(auth, signature);
     }
@@ -440,19 +499,21 @@ contract LicenseTokenTest is Test {
         _mint("1.0.0", holder, 1);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
 
         vm.prank(relayer);
         vm.expectRevert(
-            abi.encodeWithSelector(LicenseToken.UpgradeAuthorizationIsNotAMint.selector, "1.0.0")
+            abi.encodeWithSelector(
+                LicenseToken.UpgradeAuthorizationIsNotAMint.selector, _lic("1.0.0", 1)
+            )
         );
         token.mint(auth, signature);
 
         // And the holder's own upgrade still works, because nothing was consumed.
         vm.prank(holder);
         token.upgrade(auth, signature);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 1);
+        assertEq(token.balanceOf(holder, _lic("2.0.0", 1)), 1);
     }
 
     /// Transition-price arbitrage. `upgradePrice` is directional, so a caller free to choose the
@@ -472,14 +533,14 @@ contract LicenseTokenTest is Test {
         vm.stopPrank();
 
         // Authorized for the cheap transition, and it can only spend that one.
-        LicenseToken.MintAuthorization memory auth = _auth("2.0.0", "3.0.0", holder, 3);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("2.0.0", 1), "3.0.0", holder, 3);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         token.upgrade(auth, signature);
 
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "2.0.0")), 0);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "1.0.0")), 1);
-        assertEq(token.balanceOf(holder, token.tokenIdFor(address(manifest), "3.0.0")), 1);
+        assertEq(token.balanceOf(holder, _lic("2.0.0", 1)), 0);
+        assertEq(token.balanceOf(holder, _lic("1.0.0", 1)), 1);
+        assertEq(token.balanceOf(holder, _lic("3.0.0", 1)), 1);
     }
 
     function test_mintAuthorizationCannotBeSpentAsAnUpgrade() public {
@@ -507,11 +568,11 @@ contract LicenseTokenTest is Test {
 
         // Signed for the 1.0.0 source; swapped to a source that would otherwise pass every check
         // before the signature — it exists, it is held, it is priced, and it is not a downgrade.
-        LicenseToken.MintAuthorization memory signed = _auth("1.0.0", "3.0.0", holder, 3);
+        LicenseToken.MintAuthorization memory signed = _auth(_lic("1.0.0", 1), "3.0.0", holder, 3);
         bytes memory signature = _sign(signed, authorizerKey);
 
         LicenseToken.MintAuthorization memory tampered = signed;
-        tampered.fromVersion = "2.0.0";
+        tampered.fromLicenseId = _lic("2.0.0", 1);
 
         vm.prank(holder);
         vm.expectRevert(SignatureChecker.InvalidSignature.selector);
@@ -532,11 +593,15 @@ contract LicenseTokenTest is Test {
     }
 
     function test_upgradeRejectsNonceReplay() public {
+        // Burning off, so the source licence survives the first upgrade and the replay reaches the
+        // nonce check rather than stopping at `NotAHolder`.
+        vm.prank(developer);
+        manifest.setBurnOnUpgrade(false);
+
         _mint("1.0.0", holder, 1);
-        _mint("1.0.0", holder, 3);
         _allowTransition("1.0.0", "2.0.0");
 
-        LicenseToken.MintAuthorization memory auth = _auth("1.0.0", "2.0.0", holder, 2);
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
         bytes memory signature = _sign(auth, authorizerKey);
         vm.prank(holder);
         token.upgrade(auth, signature);

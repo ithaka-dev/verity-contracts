@@ -68,21 +68,39 @@ contract LicenseInvariants is Test {
     /// vanished was burned by an upgrade. A licence cannot appear from anywhere else, and a
     /// transfer moves one without creating or destroying it.
     function invariant_supplyEqualsMintsMinusBurns() public view {
-        for (uint256 mi = 0; mi < handler.manifestCount(); mi++) {
-            address m = address(handler.manifests(mi));
-            for (uint256 i = 0; i < handler.publishedCount(mi); i++) {
-                uint256 tokenId = token.tokenIdFor(m, handler.publishedAt(mi, i));
+        for (uint256 i = 0; i < handler.issuedCount(); i++) {
+            uint256 licenseId = handler.issued(i);
 
-                uint256 held;
-                for (uint256 a = 0; a < handler.actorCount(); a++) {
-                    held += token.balanceOf(handler.actors(a), tokenId);
-                }
+            uint256 held;
+            for (uint256 a = 0; a < handler.actorCount(); a++) {
+                held += token.balanceOf(handler.actors(a), licenseId);
+            }
 
-                assertEq(
-                    held,
-                    handler.ghostMinted(tokenId) - handler.ghostBurned(tokenId),
-                    "supply is not mints minus burns"
-                );
+            assertEq(
+                held,
+                handler.ghostMinted(licenseId) - handler.ghostBurned(licenseId),
+                "supply is not mints minus burns"
+            );
+        }
+    }
+
+    /// **Every licence is one indivisible unit** (ADR 0023). A balance above 1 would restore the
+    /// fungibility that made `balanceOf(holder, id)` a membership question rather than an ownership
+    /// one — the defect that let any holder of a version act on any other holder's instance.
+    function invariant_everyLicenceIsExactlyOneUnit() public view {
+        for (uint256 i = 0; i < handler.issuedCount(); i++) {
+            uint256 licenseId = handler.issued(i);
+            for (uint256 a = 0; a < handler.actorCount(); a++) {
+                assertLe(token.balanceOf(handler.actors(a), licenseId), 1, "a licence is one unit");
+            }
+        }
+    }
+
+    /// No two licences share an id, so ownership of one is never ownership of another.
+    function invariant_licenceIdsAreUnique() public view {
+        for (uint256 i = 0; i < handler.issuedCount(); i++) {
+            for (uint256 j = i + 1; j < handler.issuedCount(); j++) {
+                assertTrue(handler.issued(i) != handler.issued(j), "two licences share an id");
             }
         }
     }
@@ -111,17 +129,17 @@ contract LicenseInvariants is Test {
 
     /// A collision would let one app's licence entitle a holder to run another's, which no
     /// conservation property notices — the balances stay perfectly consistent.
-    function invariant_allTokenIdsAreDistinct() public view {
+    function invariant_allVersionIdsAreDistinct() public view {
         uint256[] memory seen = new uint256[](_totalPublished());
         uint256 n = 0;
         for (uint256 mi = 0; mi < handler.manifestCount(); mi++) {
             address m = address(handler.manifests(mi));
             for (uint256 i = 0; i < handler.publishedCount(mi); i++) {
-                uint256 tokenId = token.tokenIdFor(m, handler.publishedAt(mi, i));
+                uint256 versionId = token.versionIdFor(m, handler.publishedAt(mi, i));
                 for (uint256 j = 0; j < n; j++) {
-                    assertTrue(seen[j] != tokenId, "two (app, version) pairs share a tokenId");
+                    assertTrue(seen[j] != versionId, "two (app, version) pairs share an id");
                 }
-                seen[n++] = tokenId;
+                seen[n++] = versionId;
             }
         }
     }
@@ -144,14 +162,15 @@ contract LicenseInvariants is Test {
             AppManifest m = handler.manifests(mi);
             for (uint256 i = 0; i < handler.publishedCount(mi); i++) {
                 string memory version = handler.publishedAt(mi, i);
-                uint256 tokenId = token.tokenIdFor(address(m), version);
-                if (handler.ghostMinted(tokenId) == 0) continue;
-
-                LicenseToken.TokenOrigin memory origin = token.originOf(tokenId);
-                assertEq(origin.manifest, address(m), "origin points at the wrong app");
-                assertTrue(m.versionExists(origin.version), "origin names an unpublished version");
-                assertEq(token.uri(tokenId), m.versionRecord(version).metadataURI);
+                assertTrue(m.versionExists(version));
             }
+        }
+        for (uint256 i = 0; i < handler.issuedCount(); i++) {
+            uint256 licenseId = handler.issued(i);
+            LicenseToken.TokenOrigin memory origin = token.originOf(licenseId);
+            AppManifest m = AppManifest(origin.manifest);
+            assertTrue(m.versionExists(origin.version), "origin names an unpublished version");
+            assertEq(token.uri(licenseId), m.versionRecord(origin.version).metadataURI);
         }
     }
 
