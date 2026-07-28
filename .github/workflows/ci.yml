@@ -14,8 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
       - run: forge fmt --check
       - run: forge build --sizes
@@ -28,8 +26,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       # ADR 0005 rule 1: signature verification routes through SignatureChecker so the
       # smart-account branch cannot be bypassed. Asserted rather than trusted, because this is the
       # rule most likely to erode quietly — one hurried commit calling ecrecover directly reads as
@@ -49,7 +45,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: recursive
       - uses: foundry-rs/foundry-toolchain@v1
       - run: forge coverage --report summary
