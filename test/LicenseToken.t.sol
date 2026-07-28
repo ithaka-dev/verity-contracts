@@ -56,11 +56,14 @@ contract LicenseTokenTest is Test {
         view
         returns (LicenseToken.MintAuthorization memory)
     {
+        // Signed with whatever the manifest currently says, which is what an honest payment
+        // service would do at the moment it charged.
         return LicenseToken.MintAuthorization({
             manifest: address(manifest),
             fromVersion: from,
             version: version,
             to: to,
+            burnExpected: manifest.burnOnUpgrade(),
             nonce: nonce,
             expiry: block.timestamp + 1 hours
         });
@@ -158,6 +161,7 @@ contract LicenseTokenTest is Test {
             fromVersion: "",
             version: "1.0.0",
             to: holder,
+            burnExpected: false,
             nonce: 1,
             expiry: block.timestamp + 1 hours
         });
@@ -212,10 +216,10 @@ contract LicenseTokenTest is Test {
 
     /// ADR 0005: the smart-account branch says "not supported", not "invalid signature". Those are
     /// different problems and only one of them is the caller's.
-    /// Reached via a contract *developer*, since the constructor seeds `mintAuthorizer` from it and
-    /// the setter now refuses contracts outright. The branch must still exist and still say "not
-    /// supported" rather than "invalid signature".
-    function test_contractAuthorizerIsRejectedExplicitly() public {
+    /// A contract developer gets no seeded authorizer, so minting refuses by naming the real
+    /// problem — nobody able to sign has been nominated — rather than by reporting a signature
+    /// failure against an account that could never have produced one.
+    function test_appWithNoNominatedAuthorizerCannotMint() public {
         address contractDeveloper = address(new ContractAccount());
         AppManifest contractOwned = new AppManifest(contractDeveloper);
         vm.prank(contractDeveloper);
@@ -228,14 +232,14 @@ contract LicenseTokenTest is Test {
             fromVersion: "",
             version: "1.0.0",
             to: holder,
+            burnExpected: false,
             nonce: 1,
             expiry: block.timestamp + 1 hours
         });
         bytes memory signature = _sign(auth, authorizerKey);
+        assertEq(contractOwned.mintAuthorizer(), address(0), "no authorizer may be seeded");
         vm.expectRevert(
-            abi.encodeWithSelector(
-                SignatureChecker.SmartAccountNotSupportedInMvp.selector, contractDeveloper
-            )
+            abi.encodeWithSelector(LicenseToken.NoMintAuthorizer.selector, address(contractOwned))
         );
         token.mint(auth, signature);
     }

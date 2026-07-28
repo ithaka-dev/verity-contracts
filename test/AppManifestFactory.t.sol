@@ -95,6 +95,7 @@ contract AppManifestFactoryTest is Test {
                 fromVersion: "",
                 version: "1.0.0",
                 to: outsider,
+                burnExpected: false,
                 nonce: 1,
                 expiry: block.timestamp + 1 hours
             });
@@ -108,9 +109,25 @@ contract AppManifestFactoryTest is Test {
 
     /// The factory holds no state, so there is nothing to gate with and nothing another contract
     /// could consult as an authority over which apps are real.
-    function test_factoryHoldsNoState() public view {
+    ///
+    /// @dev **The authoritative check for this is the `factory-holds-no-state` CI job**, which
+    /// asserts `forge inspect AppManifestFactory storageLayout` is empty. Solidity cannot read a
+    /// storage layout, so a test here can only sample slots — and an earlier version of this test
+    /// did exactly that on a factory nothing had been deployed through, which passes for any
+    /// contract whatsoever and would not have noticed the `mapping(address => bool) deployedByUs`
+    /// that ADR 0021 names as the thing to prevent. A mapping's entries live at
+    /// `keccak256(key, slot)`, so slot 0 stays zero either way.
+    ///
+    /// This version at least deploys first, so a plain counter or a "last deployed" pointer shows
+    /// up. Treat it as a smoke test; the CI job is the guarantee.
+    function test_factoryHoldsNoStateAfterDeploying() public {
+        vm.prank(developer);
+        factory.deploy(SALT, developer);
+        vm.prank(outsider);
+        factory.deploy(keccak256("second"), outsider);
+
         for (uint256 slot = 0; slot < 8; slot++) {
-            assertEq(vm.load(address(factory), bytes32(slot)), bytes32(0));
+            assertEq(vm.load(address(factory), bytes32(slot)), bytes32(0), "factory wrote a slot");
         }
     }
 

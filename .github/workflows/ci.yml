@@ -40,6 +40,29 @@ jobs:
           fi
           echo "ok: ecrecover appears only in SignatureChecker"
 
+  factory-holds-no-state:
+    name: AppManifestFactory has no storage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+      # ADR 0021 rests on the factory being structurally unable to gate anything. A single mapping
+      # would be enough for something downstream to start treating absence from it as meaningful,
+      # and publishing an app would quietly require the factory's cooperation — which spec §1
+      # forbids. A Solidity test cannot see this: mapping entries live at keccak256(key, slot), so
+      # sampling slots passes either way.
+      - name: storage layout is empty
+        run: |
+          forge build --extra-output storageLayout
+          LAYOUT=$(forge inspect AppManifestFactory storageLayout --json)
+          COUNT=$(echo "$LAYOUT" | python3 -c "import json,sys; print(len(json.load(sys.stdin)['storage']))")
+          if [ "$COUNT" != "0" ]; then
+            echo "$LAYOUT"
+            echo "::error::AppManifestFactory declares $COUNT storage variable(s); see ADR 0021"
+            exit 1
+          fi
+          echo "ok: AppManifestFactory declares no storage"
+
   coverage:
     name: coverage
     runs-on: ubuntu-latest

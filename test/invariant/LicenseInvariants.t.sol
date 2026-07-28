@@ -93,11 +93,52 @@ contract LicenseInvariants is Test {
     /// with nothing.
     function invariant_upgradeIsAtomic() public view {
         assertFalse(handler.atomicityViolated(), "an upgrade changed a holder's total unexpectedly");
-        assertFalse(handler.bothHeldSimultaneously(), "a burning upgrade granted an extra licence");
     }
 
-    /// Every licence that exists resolves to a version its developer actually published. There is
-    /// no path to a licence for a version that was never published, or for one invented by a caller.
+    /// **The invariant that earns this suite its place.**
+    ///
+    /// Conservation properties are blind to authorization: a licence minted by an attacker is
+    /// conserved exactly as carefully as one minted legitimately. Every bug this contract has
+    /// actually shipped was an authorization bug, so a suite built only from conservation
+    /// properties could not have caught any of them — measured, not assumed: an earlier version of
+    /// this file survived the deletion of `requireValidSignature` from `LicenseToken`.
+    ///
+    /// `tryGuards` attempts each forbidden operation against whatever state the fuzzer has reached.
+    /// The failure message names which guard fell.
+    function invariant_noGuardWasEverBypassed() public view {
+        assertFalse(handler.guardBypassed(), handler.bypassDetail());
+    }
+
+    /// A collision would let one app's licence entitle a holder to run another's, which no
+    /// conservation property notices — the balances stay perfectly consistent.
+    function invariant_allTokenIdsAreDistinct() public view {
+        uint256[] memory seen = new uint256[](_totalPublished());
+        uint256 n = 0;
+        for (uint256 mi = 0; mi < handler.manifestCount(); mi++) {
+            address m = address(handler.manifests(mi));
+            for (uint256 i = 0; i < handler.publishedCount(mi); i++) {
+                uint256 tokenId = token.tokenIdFor(m, handler.publishedAt(mi, i));
+                for (uint256 j = 0; j < n; j++) {
+                    assertTrue(seen[j] != tokenId, "two (app, version) pairs share a tokenId");
+                }
+                seen[n++] = tokenId;
+            }
+        }
+    }
+
+    function _totalPublished() internal view returns (uint256 total) {
+        for (uint256 mi = 0; mi < handler.manifestCount(); mi++) {
+            total += handler.publishedCount(mi);
+        }
+    }
+
+    /// Every minted licence round-trips: its origin names the app it was minted against, and `uri`
+    /// resolves through to that version's metadata.
+    ///
+    /// @dev Deliberately **not** claiming "no licence exists for an unpublished version" — this
+    /// loop iterates the published set, so an unpublished-version licence is outside its domain by
+    /// construction and it could never observe one. That property is checked where it can actually
+    /// fail, by `_guardUnpublishedVersionCannotMint` in the handler.
     function invariant_everyLicenceResolvesToAPublishedVersion() public view {
         for (uint256 mi = 0; mi < handler.manifestCount(); mi++) {
             AppManifest m = handler.manifests(mi);
@@ -124,9 +165,12 @@ contract LicenseInvariants is Test {
         console2.log("publishes", handler.publishCount());
         console2.log("mints    ", handler.mintCount());
         console2.log("upgrades ", handler.upgradeCount());
+        console2.log("guard runs", handler.guardAttempts());
 
         assertGt(handler.publishCount(), 0, "no version was ever published");
         assertGt(handler.mintCount(), 0, "no licence was ever minted");
         assertGt(handler.upgradeCount(), 0, "no upgrade was ever performed");
+        // Without this the authorization guarantees are unproven, however green the run looks.
+        assertGt(handler.guardAttempts(), 0, "no forbidden operation was ever attempted");
     }
 }

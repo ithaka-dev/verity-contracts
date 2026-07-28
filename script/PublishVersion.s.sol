@@ -24,12 +24,18 @@ import {console2} from "forge-std/console2.sol";
 /// The file passed here must be **byte-identical** to what `composeURI` serves. Not equivalent, not
 /// re-serialised — identical. A pretty-printer between the two silently changes the hash.
 ///
-/// ### What this script cannot check
+/// ### What this script checks, and what it still cannot
 ///
-/// That every image inside the compose is digest-pinned rather than tagged (I8, ADR 0007), and that
-/// `imageDigest` actually appears among them. Solidity cannot parse YAML. Run the publishing tool's
-/// pre-flight check first — a tag-referenced compose keeps `composeHash` stable while the code
-/// inside it changes freely, so every check downstream passes while the guarantee is gone.
+/// It checks that `imageDigest` textually appears in the compose. That is a substring test rather
+/// than a parse — Solidity cannot read YAML — but it is enough to catch the case that matters: a
+/// record naming a digest the compose does not reference produces a licence that fails ADR 0009
+/// step 3 for every holder, permanently, with no edit path. Printing that as advice to a human
+/// while holding the file in memory was the wrong division of labour.
+///
+/// It still cannot verify that *every* image is digest-pinned rather than tagged (I8, ADR 0007).
+/// Run the publishing tool's pre-flight check for that — a tag-referenced compose keeps
+/// `composeHash` stable while the code inside it changes freely, so every check downstream passes
+/// while the guarantee is gone.
 ///
 /// ```sh
 /// VERITY_MANIFEST=0x... \
@@ -64,6 +70,23 @@ contract PublishVersion is Script {
         bytes32 metadataHash =
             bytes(metadataFile).length > 0 ? sha256(vm.readFileBinary(metadataFile)) : bytes32(0);
 
+        // Substring, lowercased on both sides so a checksum difference is not a false alarm.
+        string memory composeText = vm.toLowercase(string(compose));
+        string memory digestHex = vm.replace(vm.toLowercase(vm.toString(imageDigest)), "0x", "");
+        if (!vm.contains(composeText, digestHex)) {
+            revert(
+                string.concat("compose does not reference VERITY_IMAGE_DIGEST (", digestHex, ")")
+            );
+        }
+
+        // A URI with no hash looks like a commitment and commits to nothing: the document behind an
+        // unchanged URI can be swapped freely. Same defect as a tag-referenced image.
+        if (bytes(metadataURI).length > 0 && metadataHash == bytes32(0)) {
+            revert(
+                "VERITY_METADATA_URI is set but VERITY_METADATA_FILE is not, so metadataHash would be zero"
+            );
+        }
+
         if (manifest.versionExists(version)) {
             revert(
                 string.concat(
@@ -89,7 +112,6 @@ contract PublishVersion is Script {
         console2.log("Confirm before broadcasting:");
         console2.log(" - the file above is byte-identical to what composeURI serves");
         console2.log(" - every image in it is pinned by digest, not by tag (I8)");
-        console2.log(" - imageDigest appears among those pinned images");
 
         vm.startBroadcast();
         manifest.publishVersion(

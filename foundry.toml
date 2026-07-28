@@ -12,7 +12,10 @@ optimizer_runs = 10_000
 via_ir = false
 # Named gas snapshots so a change in cost is visible in review rather than discovered on-chain.
 gas_reports = ["LicenseToken", "AppManifest", "SignatureChecker"]
-fs_permissions = [{ access = "read", path = "./test/fixtures" }]
+# Read access to the repo root, because `PublishVersion` computes composeHash from a file the
+# developer points at — which lives wherever they keep it. Scoped to `./test/fixtures` this script
+# could not read anything at all, which is how it shipped unable to run.
+fs_permissions = [{ access = "read", path = "./" }]
 # Local runs are sized to give feedback in seconds; the `ci` profile below is where the depth that
 # actually finds things lives. Deliberately not the other way round — a local suite slow enough to
 # skip is a suite that gets skipped.

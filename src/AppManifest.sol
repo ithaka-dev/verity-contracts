@@ -85,7 +85,16 @@ contract AppManifest is IAppManifest {
     constructor(address developer_) {
         if (developer_ == address(0)) revert EmptyField("developer");
         developer = developer_;
-        mintAuthorizer = developer_;
+        // Seeded from the developer only when the developer can actually sign. A contract developer
+        // — a multisig, say — is perfectly able to publish versions, which are transactions, but
+        // cannot produce an ECDSA signature while ADR 0002 defers ERC-1271. Leaving this zero makes
+        // `LicenseToken` refuse with `NoMintAuthorizer` until an EOA is nominated, which names the
+        // real problem. Seeding it anyway would reproduce exactly the failure `setMintAuthorizer`
+        // rejects contract accounts to prevent, one constructor earlier.
+        if (developer_.code.length == 0) {
+            mintAuthorizer = developer_;
+            emit MintAuthorizerSet(developer_);
+        }
     }
 
     /// @notice Delegate mint authorization to another account, or take it back.

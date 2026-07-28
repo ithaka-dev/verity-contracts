@@ -56,12 +56,13 @@ contract LicenseToken is ERC1155, EIP712 {
         string fromVersion;
         string version;
         address to;
+        bool burnExpected;
         uint256 nonce;
         uint256 expiry;
     }
 
     bytes32 private constant _MINT_AUTHORIZATION_TYPEHASH = keccak256(
-        "MintAuthorization(address manifest,string fromVersion,string version,address to,uint256 nonce,uint256 expiry)"
+        "MintAuthorization(address manifest,string fromVersion,string version,address to,bool burnExpected,uint256 nonce,uint256 expiry)"
     );
 
     /// @notice What a `tokenId` was derived from.
@@ -90,6 +91,10 @@ contract LicenseToken is ERC1155, EIP712 {
     error UpgradeAuthorizationIsNotAMint(string fromVersion);
     /// @notice An authorization with no `fromVersion` was submitted to `upgrade`.
     error MintAuthorizationIsNotAnUpgrade();
+    /// @notice The developer changed the burn term after this authorization was signed.
+    error BurnTermChanged(bool signed, bool current);
+    /// @notice The app has not appointed an account able to authorize minting.
+    error NoMintAuthorizer(address manifest);
     /// @notice Nothing has ever been minted for this `tokenId`, so there is nothing to resolve.
     error UnknownToken(uint256 tokenId);
 
@@ -122,9 +127,13 @@ contract LicenseToken is ERC1155, EIP712 {
     // ---------------------------------------------------------------------------------------
 
     /// @notice The `tokenId` for a version of an app.
-    /// @dev `abi.encode`, not `abi.encodePacked` — packed encoding of a dynamic type lets two
-    /// different `(manifest, version)` pairs collide, and a collision here means one app's licence
-    /// entitles a holder to run another's.
+    /// @dev `abi.encode` over `(address, bytes32)`, both fixed-width.
+    ///
+    /// `abi.encodePacked` would in fact be injective *here* — a 20-byte address prefix followed by
+    /// a 32-byte hash cannot be re-split — so this is not fixing a live collision. It is chosen
+    /// because the packed form stops being injective the moment a second variable-width field is
+    /// added, and that edit would look harmless. A collision in this function means one app's
+    /// licence entitles a holder to run another's.
     function tokenIdFor(address manifest, string memory version) public pure returns (uint256) {
         return uint256(keccak256(abi.encode(manifest, keccak256(bytes(version)))));
     }
@@ -185,6 +194,7 @@ contract LicenseToken is ERC1155, EIP712 {
                     keccak256(bytes(auth.fromVersion)),
                     keccak256(bytes(auth.version)),
                     auth.to,
+                    auth.burnExpected,
                     auth.nonce,
                     auth.expiry
                 )
@@ -193,6 +203,11 @@ contract LicenseToken is ERC1155, EIP712 {
     }
 
     /// @notice Whether a `(manifest, nonce)` pair has been spent.
+    /// @dev Keyed on the **manifest, not the signer**, so the space is shared across successive
+    /// authorizers. A developer who minted for themselves and later delegated to a payment service
+    /// leaves used numbers behind, and a service starting its own counter at zero will collide with
+    /// them. Harmless — the collision reverts and a different nonce works — but it is the natural
+    /// implementation, so integrators should draw nonces randomly or seed above the high-water mark.
     function nonceUsed(address manifest, uint256 nonce) external view returns (bool) {
         return _nonceUsed[manifest][nonce];
     }
@@ -255,7 +270,16 @@ contract LicenseToken is ERC1155, EIP712 {
 
         _consumeAuthorization(auth, signature);
 
+        // The economic terms the holder paid for are part of what they were sold, so they belong
+        // in the signature rather than being read from mutable state at execution time. Without
+        // this, a developer who priced an upgrade at `burnOnUpgrade = false` — deliberately giving
+        // away concurrency, and charging for it — can front-run the holder's transaction with
+        // `setBurnOnUpgrade(true)` and burn the licence the holder just paid to keep.
+        //
+        // `downgradesAllowed` and `upgradePrice(...).allowed` are read late too, but both fail
+        // safe: flipping them reverts the upgrade. Only this one destroys something.
         bool burned = manifest.burnOnUpgrade();
+        if (burned != auth.burnExpected) revert BurnTermChanged(auth.burnExpected, burned);
         if (burned) {
             _burn(msg.sender, fromTokenId, 1);
         }
@@ -293,6 +317,10 @@ contract LicenseToken is ERC1155, EIP712 {
         _nonceUsed[auth.manifest][auth.nonce] = true;
 
         address authorizer = IAppManifest(auth.manifest).mintAuthorizer();
+        // Zero means the app has a contract developer and has not yet nominated an EOA to sign for
+        // it. Named explicitly, because `ecrecover` returning zero on a malformed signature would
+        // otherwise compare equal to it and mint.
+        if (authorizer == address(0)) revert NoMintAuthorizer(auth.manifest);
         authorizer.requireValidSignature(hashMintAuthorization(auth), signature);
     }
 
