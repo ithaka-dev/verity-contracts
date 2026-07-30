@@ -579,6 +579,129 @@ contract LicenseTokenTest is Test {
         token.upgrade(tampered, signature);
     }
 
+    // — instance binding: holding a licence is not owning an instance —
+
+    bytes32 internal constant INSTANCE_A = bytes32(uint256(0xA1));
+    bytes32 internal constant INSTANCE_B = bytes32(uint256(0xB2));
+
+    function test_aHolderBindsTheirOwnInstance() public {
+        uint256 licenseId = _mint("1.0.0", holder, 1);
+
+        vm.prank(holder);
+        token.bindInstance(licenseId, INSTANCE_A);
+
+        assertEq(token.instanceOf(licenseId), INSTANCE_A);
+        assertEq(token.claimedBy(INSTANCE_A), licenseId);
+    }
+
+    /// **The property this binding exists for.** `relayer` is a genuine customer holding a genuine
+    /// licence for the same version, and still cannot point it at somebody else's instance.
+    function test_aHolderCannotClaimAnotherHoldersInstance() public {
+        uint256 alice = _mint("1.0.0", holder, 1);
+        uint256 mallory = _mint("1.0.0", relayer, 2);
+
+        vm.prank(holder);
+        token.bindInstance(alice, INSTANCE_A);
+
+        vm.prank(relayer);
+        vm.expectRevert(
+            abi.encodeWithSelector(LicenseToken.InstanceAlreadyClaimed.selector, INSTANCE_A, alice)
+        );
+        token.bindInstance(mallory, INSTANCE_A);
+
+        assertEq(token.instanceOf(alice), INSTANCE_A, "the victim keeps their instance");
+    }
+
+    /// A claim is permanent, so waiting for a holder to move on does not free their instance.
+    function test_anInstanceStaysClaimedAfterTheHolderRebinds() public {
+        uint256 alice = _mint("1.0.0", holder, 1);
+        uint256 mallory = _mint("1.0.0", relayer, 2);
+
+        vm.startPrank(holder);
+        token.bindInstance(alice, INSTANCE_A);
+        token.bindInstance(alice, INSTANCE_B); // the first instance was destroyed
+        vm.stopPrank();
+
+        assertEq(token.instanceOf(alice), INSTANCE_B);
+        assertEq(token.claimedBy(INSTANCE_A), alice, "the abandoned instance is still claimed");
+
+        vm.prank(relayer);
+        vm.expectRevert(
+            abi.encodeWithSelector(LicenseToken.InstanceAlreadyClaimed.selector, INSTANCE_A, alice)
+        );
+        token.bindInstance(mallory, INSTANCE_A);
+    }
+
+    /// Instances are destroyed; a holder needs a path to a replacement.
+    function test_aHolderCanRebindToAFreshInstance() public {
+        uint256 licenseId = _mint("1.0.0", holder, 1);
+
+        vm.startPrank(holder);
+        token.bindInstance(licenseId, INSTANCE_A);
+        token.bindInstance(licenseId, INSTANCE_B);
+        vm.stopPrank();
+
+        assertEq(token.instanceOf(licenseId), INSTANCE_B);
+    }
+
+    function test_onlyTheHolderMayBind() public {
+        uint256 licenseId = _mint("1.0.0", holder, 1);
+
+        vm.prank(relayer);
+        vm.expectRevert(
+            abi.encodeWithSelector(LicenseToken.NotLicenseHolder.selector, relayer, licenseId)
+        );
+        token.bindInstance(licenseId, INSTANCE_A);
+    }
+
+    /// Zero means "unbound", so binding to it would make an unbound licence look bound.
+    function test_anEmptyInstanceIdIsRefused() public {
+        uint256 licenseId = _mint("1.0.0", holder, 1);
+        vm.prank(holder);
+        vm.expectRevert(LicenseToken.EmptyInstanceId.selector);
+        token.bindInstance(licenseId, bytes32(0));
+    }
+
+    /// **Without this the act of upgrading would lock a holder out of their own instance:** the new
+    /// licence would be unbound, and rebinding would be refused because the old licence's claim is
+    /// permanent.
+    function test_anUpgradeCarriesTheBindingToTheNewLicence() public {
+        uint256 oldLicense = _mint("1.0.0", holder, 1);
+        _allowTransition("1.0.0", "2.0.0");
+
+        vm.prank(holder);
+        token.bindInstance(oldLicense, INSTANCE_A);
+
+        LicenseToken.MintAuthorization memory auth = _auth(oldLicense, "2.0.0", holder, 2);
+        bytes memory signature = _sign(auth, authorizerKey);
+        vm.prank(holder);
+        uint256 newLicense = token.upgrade(auth, signature);
+
+        assertEq(token.instanceOf(newLicense), INSTANCE_A, "the instance follows the holder");
+        assertEq(token.claimedBy(INSTANCE_A), newLicense);
+        assertEq(token.instanceOf(oldLicense), bytes32(0), "the spent licence keeps nothing");
+    }
+
+    /// §2.6: transfer the token, transfer the living instance. The binding is keyed on the licence,
+    /// so it moves with it and needs no separate handover act.
+    function test_transferCarriesTheInstanceToTheNewHolder() public {
+        uint256 licenseId = _mint("1.0.0", holder, 1);
+        vm.prank(holder);
+        token.bindInstance(licenseId, INSTANCE_A);
+
+        vm.prank(holder);
+        token.safeTransferFrom(holder, relayer, licenseId, 1, "");
+
+        assertEq(token.instanceOf(licenseId), INSTANCE_A, "the binding follows the licence");
+        assertEq(token.balanceOf(relayer, licenseId), 1);
+        // And the previous holder can no longer bind it anywhere, because they hold nothing.
+        vm.prank(holder);
+        vm.expectRevert(
+            abi.encodeWithSelector(LicenseToken.NotLicenseHolder.selector, holder, licenseId)
+        );
+        token.bindInstance(licenseId, INSTANCE_B);
+    }
+
     // — L-2: a delegation that could never work fails where the mistake was made —
 
     function test_cannotDelegateMintingToAContractAccount() public {

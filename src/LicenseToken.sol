@@ -107,6 +107,12 @@ contract LicenseToken is ERC1155, EIP712 {
     error NoMintAuthorizer(address manifest);
     /// @notice Nothing has ever been minted for this `tokenId`, so there is nothing to resolve.
     error UnknownToken(uint256 tokenId);
+    /// @notice The caller does not hold the licence they are binding.
+    error NotLicenseHolder(address caller, uint256 licenseId);
+    /// @notice Another licence claimed this instance first, and a claim is permanent.
+    error InstanceAlreadyClaimed(bytes32 instanceId, uint256 claimedBy);
+    /// @notice An instance id of zero would compare equal to "unbound".
+    error EmptyInstanceId();
 
     /// @notice A `tokenId` was resolved to its manifest and version for the first time.
     event TokenOriginRecorded(
@@ -115,6 +121,10 @@ contract LicenseToken is ERC1155, EIP712 {
     /// @notice A licence was minted against an authorization.
     event LicenseMinted(
         uint256 indexed tokenId, address indexed to, address indexed manifest, string version
+    );
+    /// @notice A licence was bound to the instance it runs.
+    event InstanceBound(
+        uint256 indexed licenseId, bytes32 indexed instanceId, address indexed holder
     );
     /// @notice A holder moved between versions. Burn and mint happened in this one transaction.
     event LicenseUpgraded(
@@ -126,6 +136,16 @@ contract LicenseToken is ERC1155, EIP712 {
     );
 
     mapping(uint256 licenseId => TokenOrigin origin) private _origin;
+
+    /// @dev Which instance a licence runs. Rebindable by the holder — an instance can be destroyed,
+    /// and the holder needs a path to a replacement.
+    mapping(uint256 licenseId => bytes32 instanceId) private _instanceOf;
+
+    /// @dev Which licence claimed an instance. **Effectively write-once, and that is the safety
+    /// property.** `_instanceOf` is a convenience; this is what stops one holder from pointing their
+    /// licence at another holder's running instance. Never cleared, so an instance the holder has
+    /// moved on from still cannot be claimed by anyone else.
+    mapping(bytes32 instanceId => uint256 licenseId) private _claimedBy;
     /// @dev Per-version mint counter. The next licence's serial is this plus one.
     mapping(uint256 versionId => uint256 minted) private _serial;
     mapping(address manifest => mapping(uint256 nonce => bool used)) private _nonceUsed;
@@ -215,6 +235,76 @@ contract LicenseToken is ERC1155, EIP712 {
         TokenOrigin memory origin = _origin[tokenId];
         if (origin.manifest == address(0)) revert UnknownToken(tokenId);
         return IAppManifest(origin.manifest).versionRecord(origin.version).metadataURI;
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Instance binding
+    // ---------------------------------------------------------------------------------------
+
+    /// @notice Bind a licence to the instance it runs.
+    ///
+    /// @dev **Holding a licence is not the same as owning an instance, and this is where the second
+    /// half comes from.**
+    ///
+    /// A licence says what its holder may run (ADR 0023). It cannot say *which* of several identical
+    /// instances of the same version is theirs — several holders of the same version are
+    /// indistinguishable from the outside, which is exactly what let one act on another's instance
+    /// before per-unit ids landed. An app needs both answers, and only one of them was on chain.
+    ///
+    /// So the holder states it themselves, in their own transaction. **The orchestrator is not
+    /// involved and cannot be**: it writes nothing to chain, which is a large part of what keeps it
+    /// replaceable under spec §2.8. A binding written by the orchestrator would be discretion over
+    /// who owns what, which is the thing invariant I3 exists to prevent.
+    ///
+    /// ### Why the instance claim is permanent and the licence binding is not
+    ///
+    /// `_claimedBy` is never cleared. An instance id, once claimed, belongs to that licence forever
+    /// — so a holder cannot point their licence at somebody else's running instance, and cannot do
+    /// it later by waiting for that holder to move on.
+    ///
+    /// `_instanceOf` is rebindable, because instances are destroyed and holders need a path to a
+    /// replacement. Rebinding to a *fresh* instance is always allowed; rebinding to a *claimed* one
+    /// never is.
+    ///
+    /// ### The residual, stated rather than hidden
+    ///
+    /// A fresh instance is unclaimed until someone claims it, so an attacker who learns its id
+    /// before the holder binds can claim it first. What they get is a **denial of service on an
+    /// empty instance** — the app serves nothing until bound, so there is no data to reach — and
+    /// unlike the volume-based binding it replaced, the theft is a visible on-chain event the holder
+    /// can check for before using the instance.
+    ///
+    /// Narrowing it further means not disclosing the instance id until it is bound, which is the
+    /// orchestrator's redeem path rather than this contract.
+    function bindInstance(uint256 licenseId, bytes32 instanceId) external {
+        if (instanceId == bytes32(0)) revert EmptyInstanceId();
+        if (balanceOf(msg.sender, licenseId) == 0) {
+            revert NotLicenseHolder(msg.sender, licenseId);
+        }
+
+        uint256 claimant = _claimedBy[instanceId];
+        if (claimant != 0 && claimant != licenseId) {
+            revert InstanceAlreadyClaimed(instanceId, claimant);
+        }
+
+        _claimedBy[instanceId] = licenseId;
+        _instanceOf[licenseId] = instanceId;
+        emit InstanceBound(licenseId, instanceId, msg.sender);
+    }
+
+    /// @notice The instance a licence runs, or zero if it has not been bound.
+    ///
+    /// @dev **This is the question an app must ask**, alongside "does the signer hold this licence".
+    /// Neither is sufficient alone: the first without the second lets a stranger act on a bound
+    /// instance, and the second without the first lets any holder of the version act on any
+    /// instance of it.
+    function instanceOf(uint256 licenseId) external view returns (bytes32) {
+        return _instanceOf[licenseId];
+    }
+
+    /// @notice The licence that claimed an instance, or zero. Permanent once set.
+    function claimedBy(bytes32 instanceId) external view returns (uint256) {
+        return _claimedBy[instanceId];
     }
 
     // ---------------------------------------------------------------------------------------
@@ -339,6 +429,21 @@ contract LicenseToken is ERC1155, EIP712 {
         }
 
         licenseId = _issue(auth.manifest, auth.version, msg.sender);
+
+        // The binding follows the holder across the upgrade. Without this, every upgrade would
+        // strand the instance: the new licence would be unbound, and rebinding would be refused
+        // because the old licence's claim on that instance is permanent. The holder would be locked
+        // out of their own running instance by the act of upgrading it.
+        //
+        // Carrying it grants nothing new — it is the same holder, the same instance, and an upgrade
+        // is already their own act on their own licence.
+        bytes32 boundInstance = _instanceOf[auth.fromLicenseId];
+        if (boundInstance != bytes32(0)) {
+            _instanceOf[licenseId] = boundInstance;
+            _claimedBy[boundInstance] = licenseId;
+            delete _instanceOf[auth.fromLicenseId];
+            emit InstanceBound(licenseId, boundInstance, msg.sender);
+        }
 
         emit LicenseUpgraded(msg.sender, auth.manifest, auth.fromLicenseId, licenseId, burned);
     }

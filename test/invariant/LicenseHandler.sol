@@ -259,6 +259,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         _guardUnpricedTransitionIsRefused(mi, actor, burns);
         _guardSameVersionIsRefused(mi, from, actor, burns);
         _guardStrangerCannotSetKnobs(mi);
+        _guardAnotherHoldersInstanceCannotBeClaimed(mi, from, actor);
         _guardVersionCannotBeRepublished(mi);
         _guardStrangerCannotPublish(mi);
 
@@ -547,6 +548,32 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         vm.prank(actor);
         try token.upgrade(auth, signature) {
             _bypassed("a holder upgraded another holder's licence");
+        } catch {}
+    }
+
+    /// A claimed instance belongs to that licence permanently. Anyone else pointing their own
+    /// licence at it would be claiming an instance they do not run — which is the second half of
+    /// the cross-holder defect, the half per-unit ids alone do not close.
+    function _guardAnotherHoldersInstanceCannotBeClaimed(
+        uint256 mi,
+        string memory version,
+        address actor
+    ) private {
+        address other = actor == actors[0] ? actors[1] : actors[0];
+        uint256 theirs = _licenceHeld(mi, version, other);
+        uint256 mine = _licenceHeld(mi, version, actor);
+        if (theirs == mine) return;
+
+        bytes32 instanceId = keccak256(abi.encode("instance", theirs));
+        vm.prank(other);
+        try token.bindInstance(theirs, instanceId) {}
+            catch {
+            return;
+        }
+
+        vm.prank(actor);
+        try token.bindInstance(mine, instanceId) {
+            _bypassed("a holder claimed another holder's instance");
         } catch {}
     }
 

@@ -96,6 +96,28 @@ contract LicenseInvariants is Test {
         }
     }
 
+    /// An instance is claimed by at most one licence, ever. Two licences claiming one instance
+    /// would mean two holders able to act on it, which is the defect this binding closes.
+    function invariant_noInstanceIsClaimedTwice() public view {
+        for (uint256 i = 0; i < handler.issuedCount(); i++) {
+            bytes32 instanceId = token.instanceOf(handler.issued(i));
+            if (instanceId == bytes32(0)) continue;
+            uint256 claimant = token.claimedBy(instanceId);
+            assertTrue(claimant != 0, "a bound instance must have a claimant");
+
+            for (uint256 j = 0; j < handler.issuedCount(); j++) {
+                if (i == j) continue;
+                if (token.instanceOf(handler.issued(j)) == instanceId) {
+                    assertEq(
+                        handler.issued(i),
+                        handler.issued(j),
+                        "two different licences point at one instance"
+                    );
+                }
+            }
+        }
+    }
+
     /// No two licences share an id, so ownership of one is never ownership of another.
     function invariant_licenceIdsAreUnique() public view {
         for (uint256 i = 0; i < handler.issuedCount(); i++) {
