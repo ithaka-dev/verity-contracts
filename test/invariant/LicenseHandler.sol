@@ -567,7 +567,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         bytes32 instanceId = keccak256(abi.encode("instance", theirs));
         vm.prank(other);
         try token.bindInstance(theirs, instanceId) {}
-            catch {
+        catch {
             return;
         }
 

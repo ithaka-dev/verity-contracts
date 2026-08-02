@@ -15,6 +15,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pinned. `forge fmt` output changes between versions, so an unpinned toolchain formats
+          # differently from whatever the developer has and fails `--check` on code they just
+          # formatted — which is how this job was red for days. Same reasoning as pinning nixpkgs
+          # and pinning image digests: a description that changes because upstream moved is a
+          # description of something other than what you have.
+          version: v1.7.1
       - run: forge fmt --check
       - run: forge build --sizes
       - run: forge test -vvv
@@ -36,15 +43,12 @@ jobs:
       # smart-account branch cannot be bypassed. Asserted rather than trusted, because this is the
       # rule most likely to erode quietly — one hurried commit calling ecrecover directly reads as
       # harmless and breaks every app at the mainnet gate.
+      # Strips comments and string literals before looking for a call, so the gate can be strict
+      # about calls without being wrong about mentions. The previous grep failed the build on a
+      # *comment* explaining why the rule exists — and a gate that fires on prose gets weakened by
+      # whoever is unblocking the build, which is precisely how the real check gets lost.
       - name: no ecrecover outside the checker
-        run: |
-          HITS=$(grep -rn "ecrecover" src/ --include=*.sol | grep -v "src/SignatureChecker.sol" || true)
-          if [ -n "$HITS" ]; then
-            echo "$HITS"
-            echo "::error::ecrecover called outside SignatureChecker; see ADR 0005"
-            exit 1
-          fi
-          echo "ok: ecrecover appears only in SignatureChecker"
+        run: python3 script/check-no-raw-ecrecover.py src
 
   factory-holds-no-state:
     name: AppManifestFactory has no storage
@@ -52,6 +56,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pinned. `forge fmt` output changes between versions, so an unpinned toolchain formats
+          # differently from whatever the developer has and fails `--check` on code they just
+          # formatted — which is how this job was red for days. Same reasoning as pinning nixpkgs
+          # and pinning image digests: a description that changes because upstream moved is a
+          # description of something other than what you have.
+          version: v1.7.1
       # ADR 0021 rests on the factory being structurally unable to gate anything. A single mapping
       # would be enough for something downstream to start treating absence from it as meaningful,
       # and publishing an app would quietly require the factory's cooperation — which spec §1
@@ -75,6 +86,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pinned. `forge fmt` output changes between versions, so an unpinned toolchain formats
+          # differently from whatever the developer has and fails `--check` on code they just
+          # formatted — which is how this job was red for days. Same reasoning as pinning nixpkgs
+          # and pinning image digests: a description that changes because upstream moved is a
+          # description of something other than what you have.
+          version: v1.7.1
       # Thresholds live in script/check-coverage.py so they are runnable locally and reviewable as
       # a diff, rather than buried in shell inside a workflow.
       - name: coverage thresholds
