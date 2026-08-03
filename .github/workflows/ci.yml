@@ -122,20 +122,25 @@ jobs:
       # Thresholds live in script/check-coverage.py so they are runnable locally and reviewable as
       # a diff, rather than buried in shell inside a workflow.
       #
-      # `--no-match-test invariant` is not a shortcut. Coverage instrumentation disables the
-      # optimizer, which raises gas enough that handler calls start failing — and with
-      # `fail_on_revert = false` a failed call is silently a no-op, so the sequence never performs
-      # an upgrade and `afterInvariant`'s vacuity guard fires. That guard is correct and worth
-      # keeping; it just cannot hold under instrumentation. On the default profile this makes plain
-      # `forge coverage` fail outright, which is how a developer meets it.
+      # `--no-match-test invariant` is about time, and nothing else.
       #
-      # Nothing is lost by excluding them: coverage is 100% on unit and fuzz tests alone, so the
-      # invariant suite contributes no line these do not already reach — and if that ever stops
-      # being true, the 100% floor trips and says so. The invariant suite still runs in full, at ci
-      # depth, in the `check` job, where it is measuring something coverage cannot.
+      # Coverage is 100% on the unit and fuzz tests alone, so the invariant suite reaches no line
+      # they do not — and if that ever stops being true the 100% floor trips and says so. What it
+      # does cost is ~33 minutes, against seconds without it. A gate that slow is one developers
+      # run after pushing rather than before, and this way the local command is identical to the
+      # CI one.
       #
-      # It also takes this job from ~33 minutes to seconds, and makes the local command identical
-      # to the CI one — a gate developers can actually run is a gate they run before pushing.
+      # The invariant suite still runs in full, at ci depth, in the `check` job, where it measures
+      # something coverage cannot.
+      #
+      # An earlier version of this comment claimed the exclusion was *necessary* — that coverage
+      # instrumentation disables the optimizer, handler calls run out of gas, and `afterInvariant`'s
+      # vacuity guard then fires on a sequence that did nothing. That was wrong. The guard was
+      # firing about one run in twelve for its own reason (`upgrade` and `tryGuards` returning
+      # silently when a manifest had fewer than two versions), under coverage or not, and
+      # `_ensureTwoVersions` fixed it. `forge coverage` including the invariant tests now passes on
+      # the default profile. Left recorded because a plausible-sounding cause that survives into a
+      # comment is how the next person inherits a wrong explanation.
       - name: coverage thresholds
         run: |
           forge coverage --report summary --no-match-coverage '(script|test)' \

@@ -14,9 +14,8 @@ Usage:
     forge coverage --report summary --no-match-coverage '(script|test)' \
         --no-match-test invariant | script/check-coverage.py
 
-`--no-match-test invariant` matters and the CI workflow says why: under coverage instrumentation
-the optimizer is off, handler calls run out of gas, and `afterInvariant`'s vacuity guard fires on a
-sequence that did nothing. Without the flag this command simply fails.
+`--no-match-test invariant` is for speed — ~33 minutes against seconds, for a number that does not
+change, since coverage is 100% without the invariant suite. It runs in full in CI's `check` job.
 """
 
 from __future__ import annotations
