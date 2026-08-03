@@ -20,15 +20,24 @@
 # **Do not delete a surviving mutant to make the score green.** Either write the test, or mark it
 # EQUIVALENT with a reason — a mutant that cannot change observable behaviour is not a gap.
 #
-#   ./script/mutate.sh              # all mutants
-#   ./script/mutate.sh --quick      # invariant suite only; faster, weaker
+#   ./script/mutate.sh              # the whole suite — this is the score that counts
+#   ./script/mutate.sh --quick      # invariant suite only; faster, and genuinely weaker
+#
+# Quick mode scores 14/15, and the survivor is honest rather than a gap: removing the
+# `MintAuthorizationIsNotAnUpgrade` check still reverts, just on a different error further down, and
+# an invariant guard built on `try/catch` cannot distinguish "reverted for the right reason" from
+# "reverted at all". The unit test asserting the specific error is the right place for that, so CI
+# runs the full suite.
 set -uo pipefail
 
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.foundry/bin:$PATH"
 
-QUICK=""
-[ "${1:-}" = "--quick" ] && QUICK="--match-path test/invariant/*"
+# An array, not a string. `forge test $QUICK` word-split *and* glob-expanded the pattern into two
+# paths, which forge rejected as an argument error — and a non-zero exit was being counted as a
+# kill. Every mutant in quick mode "died" without a single test running.
+FORGE_ARGS=()
+[ "${1:-}" = "--quick" ] && FORGE_ARGS=(--match-path 'test/invariant/*')
 
 backup=$(mktemp -d)
 cp -R src "$backup/"
@@ -63,7 +72,7 @@ PY
 run() {
   local name="$1"
   find cache/invariant -type f -delete 2>/dev/null
-  if forge test $QUICK >/dev/null 2>&1; then
+  if forge test ${FORGE_ARGS[@]+"${FORGE_ARGS[@]}"} >/dev/null 2>&1; then
     printf '  \033[31mSURVIVED\033[0m  %s\n' "$name"
     survivors+=("$name")
     survived=$((survived + 1))
@@ -79,7 +88,31 @@ note_equivalent() {
   equivalent=$((equivalent + 1))
 }
 
-echo "Mutation testing verity-contracts${QUICK:+ (quick)}"
+echo "Mutation testing verity-contracts${1:+ ($1)}"
+echo
+
+# — the check whose absence made this whole tool lie —
+#
+# If the *unmutated* source does not pass, every mutant "dies" for free and the score is a count of
+# nothing. That is not hypothetical: a mis-quoted argument made forge reject its own command line,
+# and the harness reported 15/15 having run no tests at all.
+#
+# So: prove the baseline is green before trusting a single kill.
+# A cached invariant failure replays and would fail the baseline for a reason that has nothing to
+# do with the current source — including failures this harness itself produced a moment ago.
+find cache/invariant -type f -delete 2>/dev/null
+
+printf 'baseline (unmutated source must pass) ... '
+if ! forge test ${FORGE_ARGS[@]+"${FORGE_ARGS[@]}"} >/tmp/mutate-baseline.log 2>&1; then
+  echo "FAILED"
+  echo
+  echo "The suite does not pass on unmutated source, so every mutant below would be counted as" >&2
+  echo "killed without any test running. Fix the baseline first." >&2
+  echo >&2
+  tail -20 /tmp/mutate-baseline.log >&2
+  exit 2
+fi
+echo "ok"
 echo
 
 echo "— authorization —"

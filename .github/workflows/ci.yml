@@ -65,7 +65,9 @@ jobs:
       #
       # A surviving mutant fails the build. So does a mutant that cannot be applied, because a
       # mutant silently absent leaves the score looking complete while a behaviour went unchecked.
-      - run: ./script/mutate.sh --quick
+      # The full suite, not --quick. Quick mode cannot distinguish "reverted for the right reason"
+      # from "reverted at all", so it under-reports by one.
+      - run: ./script/mutate.sh
 
   factory-holds-no-state:
     name: AppManifestFactory has no storage

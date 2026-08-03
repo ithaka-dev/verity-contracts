@@ -259,6 +259,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         _guardUnpricedTransitionIsRefused(mi, actor, burns);
         _guardSameVersionIsRefused(mi, from, actor, burns);
         _guardStrangerCannotSetKnobs(mi);
+        _guardStrangerCannotBindALicence(mi, from);
         _guardAnotherHoldersInstanceCannotBeClaimed(mi, from, actor);
         _guardVersionCannotBeRepublished(mi);
         _guardStrangerCannotPublish(mi);
@@ -521,6 +522,19 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         vm.prank(STRANGER);
         try m.setUpgradePrice(published[mi][0], published[mi][1], 0, true) {
             _bypassed("a stranger priced a transition");
+        } catch {}
+    }
+
+    /// Binding is a holder's act on their own licence. Mutation testing found the invariant suite
+    /// missed this entirely — removing the holder check from `bindInstance` survived, because every
+    /// other guard binds as the party that actually holds the licence.
+    function _guardStrangerCannotBindALicence(uint256 mi, string memory version) private {
+        uint256 licenseId = _licenceHeld(mi, version, actors[0]);
+        if (token.balanceOf(STRANGER, licenseId) != 0) return;
+
+        vm.prank(STRANGER);
+        try token.bindInstance(licenseId, keccak256(abi.encode("stranger", licenseId))) {
+            _bypassed("a stranger bound a licence they do not hold");
         } catch {}
     }
 
