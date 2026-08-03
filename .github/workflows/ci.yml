@@ -67,7 +67,14 @@ jobs:
       # mutant silently absent leaves the score looking complete while a behaviour went unchecked.
       # The full suite, not --quick. Quick mode cannot distinguish "reverted for the right reason"
       # from "reverted at all", so it under-reports by one.
+      #
+      # Default profile, not `ci`. Mutation testing needs the suite to *detect* a defect, not to
+      # fuzz deeply — 15 mutants × the ci profile's 4096 fuzz runs is an hour of compute that
+      # detects nothing the shallower profile misses. The `ci` profile's depth belongs in the test
+      # job, which runs once.
       - run: ./script/mutate.sh
+        env:
+          FOUNDRY_PROFILE: default
 
   factory-holds-no-state:
     name: AppManifestFactory has no storage
