@@ -11,6 +11,54 @@ import {Test} from "forge-std/Test.sol";
 /// failing as a bad signature.
 contract ContractAccount {}
 
+/// @dev A manifest that answers, but lies.
+///
+/// `auth.manifest` is supplied by whoever submits the authorization, so `LicenseToken` is talking
+/// to an address of the caller's choosing — nothing obliges it to be an `AppManifest`. Every guard
+/// downstream of that call has to hold against a contract built to defeat it, and the only way to
+/// know one does is to build that contract.
+///
+/// This one issues a version record freely, so a licence can be minted against it, then reports
+/// publication index 0 — the value a real manifest uses to mean "no such version". A licence whose
+/// own manifest disowns its version is the state that reaches the `fromIndex == 0` guard.
+contract LyingManifest {
+    address public developer;
+    address public mintAuthorizer;
+    bool public burnOnUpgrade;
+    bool public downgradesAllowed = true;
+
+    constructor(address authorizer_) {
+        developer = msg.sender;
+        mintAuthorizer = authorizer_;
+    }
+
+    function versionRecord(string calldata)
+        external
+        pure
+        returns (IAppManifest.VersionRecord memory)
+    {
+        return IAppManifest.VersionRecord({
+            imageDigest: keccak256("image"),
+            composeHash: keccak256("compose"),
+            composeURI: "ipfs://whatever",
+            capabilities: 0,
+            metadataHash: bytes32(0),
+            metadataURI: "",
+            index: 0,
+            exists: true
+        });
+    }
+
+    /// The lie. A real manifest returns 0 only for a version it has never published.
+    function versionIndex(string calldata) external pure returns (uint256) {
+        return 0;
+    }
+
+    function upgradePrice(string calldata, string calldata) external pure returns (uint256, bool) {
+        return (0, true);
+    }
+}
+
 contract LicenseTokenTest is Test {
     LicenseToken internal token;
     AppManifest internal manifest;
@@ -736,5 +784,158 @@ contract LicenseTokenTest is Test {
             )
         );
         token.upgrade(auth, signature);
+    }
+
+    // — T-08: the refusals nothing had exercised —
+
+    /// Zero is what `_origin` holds for every id that was never issued, and ids are computed
+    /// offline from an address and a string (`licenseIdFor`), so *any* number is a well-formed
+    /// query. Returning the zeroed struct would tell a caller that licence 12345 exists, belongs to
+    /// app `address(0)`, and names version "" — three false statements, none of them detectable.
+    function test_originOfRefusesATokenThatWasNeverIssued() public {
+        uint256 neverIssued = _lic("1.0.0", 1);
+        vm.expectRevert(abi.encodeWithSelector(LicenseToken.UnknownToken.selector, neverIssued));
+        token.originOf(neverIssued);
+
+        // And after a real mint, the *next* serial is still unknown — the guard tracks issuance,
+        // not merely whether the app exists.
+        _mint("1.0.0", holder, 1);
+        token.originOf(_lic("1.0.0", 1));
+        uint256 nextSerial = _lic("1.0.0", 2);
+        vm.expectRevert(abi.encodeWithSelector(LicenseToken.UnknownToken.selector, nextSerial));
+        token.originOf(nextSerial);
+    }
+
+    /// **A licence is an entitlement to one app, and the id alone does not say which.** The
+    /// authorization names a manifest and the licence records one; if `upgrade` did not compare
+    /// them, a holder could present a licence for app A while naming app B — burning something of
+    /// no value to B and minting a real entitlement to it. The signature does not prevent this:
+    /// B's own authorizer signed it, having been told only an id.
+    function test_upgradeRefusesALicenceBelongingToADifferentApp() public {
+        uint256 licence = _mint("1.0.0", holder, 1);
+
+        AppManifest otherApp = new AppManifest(developer);
+        vm.startPrank(developer);
+        otherApp.publishVersion(
+            "1.0.0", IMAGE_DIGEST, COMPOSE_V1, "ipfs://other-1", 0, bytes32(0), ""
+        );
+        otherApp.publishVersion(
+            "2.0.0", IMAGE_DIGEST, COMPOSE_V2, "ipfs://other-2", 0, bytes32(0), ""
+        );
+        otherApp.setMintAuthorizer(authorizer);
+        otherApp.setUpgradePrice("1.0.0", "2.0.0", 1 ether, true);
+        vm.stopPrank();
+
+        LicenseToken.MintAuthorization memory auth = LicenseToken.MintAuthorization({
+            manifest: address(otherApp),
+            fromLicenseId: licence, // issued by `manifest`, not by `otherApp`
+            version: "2.0.0",
+            to: holder,
+            burnExpected: otherApp.burnOnUpgrade(),
+            nonce: 2,
+            expiry: block.timestamp + 1 hours
+        });
+
+        bytes memory signature = _sign(auth, authorizerKey);
+        vm.prank(holder);
+        vm.expectRevert(abi.encodeWithSelector(LicenseToken.UnknownLicense.selector, licence));
+        token.upgrade(auth, signature);
+    }
+
+    /// The same guard, on the simpler input: an id no app ever issued.
+    function test_upgradeRefusesALicenceThatWasNeverIssued() public {
+        _allowTransition("1.0.0", "2.0.0");
+        uint256 phantom = _lic("1.0.0", 99);
+
+        LicenseToken.MintAuthorization memory auth = _auth(phantom, "2.0.0", holder, 1);
+        bytes memory signature = _sign(auth, authorizerKey);
+        vm.prank(holder);
+        vm.expectRevert(abi.encodeWithSelector(LicenseToken.UnknownLicense.selector, phantom));
+        token.upgrade(auth, signature);
+    }
+
+    /// Reached only through a manifest built to lie, which is the point: `auth.manifest` is
+    /// caller-supplied, so this guard's job is to hold when the contract on the other end is
+    /// hostile. It refuses rather than reading index 0 as "position zero" and computing a
+    /// downgrade against it.
+    function test_upgradeRefusesAVersionItsOwnManifestDisowns() public {
+        LyingManifest lying = new LyingManifest(authorizer);
+
+        LicenseToken.MintAuthorization memory mintAuth = LicenseToken.MintAuthorization({
+            manifest: address(lying),
+            fromLicenseId: 0,
+            version: "1.0.0",
+            to: holder,
+            burnExpected: false,
+            nonce: 1,
+            expiry: block.timestamp + 1 hours
+        });
+        uint256 licence = token.mint(mintAuth, _sign(mintAuth, authorizerKey));
+
+        LicenseToken.MintAuthorization memory auth = LicenseToken.MintAuthorization({
+            manifest: address(lying),
+            fromLicenseId: licence,
+            version: "2.0.0",
+            to: holder,
+            burnExpected: false,
+            nonce: 2,
+            expiry: block.timestamp + 1 hours
+        });
+
+        bytes memory signature = _sign(auth, authorizerKey);
+        vm.prank(holder);
+        vm.expectRevert(
+            abi.encodeWithSelector(LicenseToken.TransitionNotAllowed.selector, "1.0.0", "2.0.0")
+        );
+        token.upgrade(auth, signature);
+    }
+
+    /// **The one term whose reversal destroys something.** Burn-on-upgrade is the developer's to
+    /// set and theirs to change, but changing it between the moment a holder is quoted and the
+    /// moment they execute changes what the transaction *does*: not burning yields an extra
+    /// runnable instance under §2.9, burning takes the old entitlement away for good. So the
+    /// authorization carries the term it was sold under and the contract refuses if the manifest no
+    /// longer agrees. Every other term flipping merely reverts; this one would succeed, quietly,
+    /// having burned a licence the holder was told they would keep.
+    function test_upgradeRefusesWhenTheBurnTermChangedAfterTheSale() public {
+        assertTrue(manifest.burnOnUpgrade(), "the default this test depends on");
+        _mint("1.0.0", holder, 1);
+        _allowTransition("1.0.0", "2.0.0");
+
+        // Signed while burning is in force — `_auth` reads the manifest, as an honest payment
+        // service would at the moment it charged.
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
+        bytes memory signature = _sign(auth, authorizerKey);
+        assertTrue(auth.burnExpected);
+
+        vm.prank(developer);
+        manifest.setBurnOnUpgrade(false);
+
+        vm.prank(holder);
+        vm.expectRevert(abi.encodeWithSelector(LicenseToken.BurnTermChanged.selector, true, false));
+        token.upgrade(auth, signature);
+    }
+
+    /// And the other direction, which is the one that costs the holder something: quoted without a
+    /// burn, executed with one.
+    function test_upgradeRefusesWhenBurningWasTurnedOnAfterTheSale() public {
+        vm.prank(developer);
+        manifest.setBurnOnUpgrade(false);
+
+        _mint("1.0.0", holder, 1);
+        _allowTransition("1.0.0", "2.0.0");
+
+        LicenseToken.MintAuthorization memory auth = _auth(_lic("1.0.0", 1), "2.0.0", holder, 2);
+        bytes memory signature = _sign(auth, authorizerKey);
+        assertFalse(auth.burnExpected);
+
+        vm.prank(developer);
+        manifest.setBurnOnUpgrade(true);
+
+        vm.prank(holder);
+        vm.expectRevert(abi.encodeWithSelector(LicenseToken.BurnTermChanged.selector, false, true));
+        token.upgrade(auth, signature);
+
+        assertEq(token.balanceOf(holder, _lic("1.0.0", 1)), 1, "the licence must still be there");
     }
 }

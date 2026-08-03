@@ -255,4 +255,73 @@ contract AppManifestTest is Test {
         vm.expectRevert(abi.encodeWithSelector(AppManifest.NotDeveloper.selector, caller));
         manifest.publishVersion("x", IMAGE_DIGEST, COMPOSE_HASH, "ipfs://x", 0, bytes32(0), "");
     }
+
+    // — T-08: the refusals nothing had exercised —
+    //
+    // Every one of these is a `revert` that had never executed. A guard no test runs is
+    // indistinguishable from a guard that does not work, and these are the guards that decide
+    // whether a *malformed* manifest can exist at all — a version with no name, an app with no
+    // developer, a price quoted for a version that was never published. Each one, unenforced,
+    // produces a record that reads as valid and binds to nothing.
+
+    /// An app with no developer has no one who can publish to it, so it is a manifest that can
+    /// never hold a version — and under ADR 0011 the manifest address *is* the app's identity, so
+    /// this would mint an identity for an app that cannot exist.
+    function test_refusesAManifestWithNoDeveloper() public {
+        vm.expectRevert(abi.encodeWithSelector(AppManifest.EmptyField.selector, "developer"));
+        new AppManifest(address(0));
+    }
+
+    /// Zero here does not disable minting, it makes `LicenseToken` compare a recovered signer
+    /// against `address(0)` — and `ecrecover` returns `address(0)` for a malformed signature. The
+    /// two would meet, and garbage would authorize a mint.
+    function test_refusesAZeroMintAuthorizer() public {
+        vm.prank(dev);
+        vm.expectRevert(abi.encodeWithSelector(AppManifest.EmptyField.selector, "mintAuthorizer"));
+        manifest.setMintAuthorizer(address(0));
+    }
+
+    /// The empty string is a valid mapping key, so an unnamed version would publish successfully
+    /// and then be unaddressable by anything a holder could type.
+    function test_refusesAVersionWithNoName() public {
+        vm.prank(dev);
+        vm.expectRevert(abi.encodeWithSelector(AppManifest.EmptyField.selector, "version"));
+        manifest.publishVersion("", IMAGE_DIGEST, COMPOSE_HASH, "ipfs://x", 0, bytes32(0), "");
+    }
+
+    /// Both ends, because a price is a claim about a transition and a transition needs two real
+    /// endpoints. Priced against a version that does not exist, it is a transition no holder can
+    /// ever take — and worse, it would start working the day someone published that name.
+    function test_refusesAPriceForAnUnpublishedVersion() public {
+        _publish("1.0.0", COMPOSE_HASH);
+
+        vm.startPrank(dev);
+        vm.expectRevert(abi.encodeWithSelector(AppManifest.UnknownVersion.selector, "0.9.0"));
+        manifest.setUpgradePrice("0.9.0", "1.0.0", 1 ether, true);
+
+        vm.expectRevert(abi.encodeWithSelector(AppManifest.UnknownVersion.selector, "2.0.0"));
+        manifest.setUpgradePrice("1.0.0", "2.0.0", 1 ether, true);
+        vm.stopPrank();
+    }
+
+    /// Refuses rather than answering `false`. "This version declares no capabilities" and "there is
+    /// no such version" are different facts, and a caller that cannot tell them apart will treat a
+    /// typo'd version as an app that simply does not implement `migrate`.
+    function test_capabilityQueryRefusesAnUnknownVersionRatherThanSayingNo() public {
+        _publish("1.0.0", COMPOSE_HASH);
+        uint256 migrate = manifest.CAPABILITY_MIGRATE();
+        vm.expectRevert(abi.encodeWithSelector(AppManifest.UnknownVersion.selector, "9.9.9"));
+        manifest.hasCapability("9.9.9", migrate);
+    }
+
+    /// `versionCount` is what makes publication order observable off-chain, and I5 makes it
+    /// monotonic. Downgrade detection reads the same counter.
+    function test_versionCountTracksPublication() public {
+        assertEq(manifest.versionCount(), 0);
+        _publish("1.0.0", COMPOSE_HASH);
+        assertEq(manifest.versionCount(), 1);
+        _publish("2.0.0", keccak256("compose-2"));
+        assertEq(manifest.versionCount(), 2);
+        assertEq(manifest.versionIndex("2.0.0"), 2, "index is the 1-based publication order");
+    }
 }

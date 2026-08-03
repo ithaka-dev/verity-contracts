@@ -20,12 +20,23 @@ fs_permissions = [{ access = "read", path = "./" }]
 # actually finds things lives. Deliberately not the other way round — a local suite slow enough to
 # skip is a suite that gets skipped.
 #
-# `depth` is also load-bearing for the vacuity guard in `afterInvariant`, which runs per sequence:
-# with eight fuzzer-selectable handler actions, the chance a given run never selects `upgrade` at all
-# is (7/8)^depth — at depth 32 that is ~1.4% per run, a near-certain flake over a few hundred runs,
-# and at depth 64 it is ~0.02%. Depth is what makes "this run exercised the operation" true rather
-# than likely. Recount the actions when adding one; this comment was wrong on both inputs after
-# `advanceTime` was added and nothing failed to say so.
+# `depth` is also load-bearing for the vacuity guard in `afterInvariant`, which runs per sequence.
+#
+# This comment used to estimate the flake risk as the chance of the fuzzer never *selecting*
+# `upgrade` — (7/8)^depth, ~0.02% at depth 64 — and concluded depth made it a non-issue. That was
+# the wrong question, and the suite went on flaking at roughly one run in twelve. The real gap was
+# selecting the action and finding nothing to do: `upgrade` and `tryGuards` both need two versions
+# on the *particular* manifest picked, publishes spread across several manifests, and both used to
+# return silently when the precondition was unmet. Under `fail_on_revert = false` that return is
+# indistinguishable from work.
+#
+# `_ensureTwoVersions` in the handler now establishes the precondition instead, which took 20
+# consecutive clean runs. Depth still helps, but it was never what made the guard hold.
+#
+# **Clear `cache/invariant` when measuring any of this.** Foundry caches a failing sequence and
+# replays it every subsequent run, so one flake looks like a permanent failure — the reason
+# `script/mutate.sh` deletes it before the baseline, and the reason six "reproductions" of this bug
+# were one stale cache entry.
 invariant = { runs = 32, depth = 64, fail_on_revert = false }
 
 [fmt]

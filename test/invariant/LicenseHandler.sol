@@ -135,8 +135,8 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         external
     {
         uint256 mi = _boundManifest(manifestSeed);
+        _ensureTwoVersions(mi);
         uint256 count = published[mi].length;
-        if (count < 2) return;
 
         AppManifest m = manifests[mi];
 
@@ -230,7 +230,7 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
     /// a unit test is that these run against states nobody enumerated.
     function tryGuards(uint256 manifestSeed, uint256 actorSeed) external {
         uint256 mi = _boundManifest(manifestSeed);
-        if (published[mi].length < 2) return;
+        _ensureTwoVersions(mi);
 
         AppManifest m = manifests[mi];
         address actor = _actor(actorSeed);
@@ -683,6 +683,29 @@ contract LicenseHandler is CommonBase, StdCheats, StdUtils {
         issued.push(id);
         licenseManifest[id] = mi;
         mintCount++;
+    }
+
+    /// @dev **Publish rather than return.** Both `upgrade` and `tryGuards` need two versions on the
+    /// *particular* manifest the fuzzer picked, and both used to give up silently when it had
+    /// fewer. That is what made this suite fail intermittently on seed luck: publishes spread
+    /// across several manifests, a sequence that never lined them up performed no upgrade and
+    /// attempted no forbidden operation, and `afterInvariant`'s vacuity guard reported — correctly
+    /// — a run that had proven nothing. Measured at roughly one failure in twelve.
+    ///
+    /// Under `fail_on_revert = false` a silent `return` is indistinguishable from work, which is
+    /// why the vacuity guard has to exist and why this has to be fixed here rather than there.
+    ///
+    /// The estimate in `foundry.toml` missed it by asking the wrong question: it computed the
+    /// chance of the fuzzer never *selecting* an action, when the gap was selecting one and finding
+    /// nothing to do.
+    ///
+    /// Establishing the precondition is what `_licenceHeld` already does for licences. It weakens
+    /// nothing — a version published here is subject to every invariant a fuzzer-ordered publish
+    /// is, and the operations under test are the ones that follow.
+    function _ensureTwoVersions(uint256 mi) internal {
+        while (published[mi].length < 2) {
+            _publish(mi, 0);
+        }
     }
 
     /// A licence `actor` currently holds for `version`, minting one if they hold none.

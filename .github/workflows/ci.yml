@@ -121,8 +121,24 @@ jobs:
           version: v1.7.1
       # Thresholds live in script/check-coverage.py so they are runnable locally and reviewable as
       # a diff, rather than buried in shell inside a workflow.
+      #
+      # `--no-match-test invariant` is not a shortcut. Coverage instrumentation disables the
+      # optimizer, which raises gas enough that handler calls start failing — and with
+      # `fail_on_revert = false` a failed call is silently a no-op, so the sequence never performs
+      # an upgrade and `afterInvariant`'s vacuity guard fires. That guard is correct and worth
+      # keeping; it just cannot hold under instrumentation. On the default profile this makes plain
+      # `forge coverage` fail outright, which is how a developer meets it.
+      #
+      # Nothing is lost by excluding them: coverage is 100% on unit and fuzz tests alone, so the
+      # invariant suite contributes no line these do not already reach — and if that ever stops
+      # being true, the 100% floor trips and says so. The invariant suite still runs in full, at ci
+      # depth, in the `check` job, where it is measuring something coverage cannot.
+      #
+      # It also takes this job from ~33 minutes to seconds, and makes the local command identical
+      # to the CI one — a gate developers can actually run is a gate they run before pushing.
       - name: coverage thresholds
         run: |
-          forge coverage --report summary --no-match-coverage '(script|test)' > coverage.txt
+          forge coverage --report summary --no-match-coverage '(script|test)' \
+            --no-match-test invariant > coverage.txt
           cat coverage.txt
           python3 script/check-coverage.py coverage.txt

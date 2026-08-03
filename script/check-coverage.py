@@ -11,7 +11,12 @@ a build pass** — if a change genuinely justifies a lower floor, that belongs i
 where a reviewer sees it.
 
 Usage:
-    forge coverage --report summary --no-match-coverage '(script|test)' | script/check-coverage.py
+    forge coverage --report summary --no-match-coverage '(script|test)' \
+        --no-match-test invariant | script/check-coverage.py
+
+`--no-match-test invariant` matters and the CI workflow says why: under coverage instrumentation
+the optimizer is off, handler calls run out of gas, and `afterInvariant`'s vacuity guard fires on a
+sequence that did nothing. Without the flag this command simply fails.
 """
 
 from __future__ import annotations
@@ -20,7 +25,23 @@ import re
 import sys
 
 # lines, statements, branches, functions
-FLOORS = {"lines": 95.0, "statements": 93.0, "branches": 78.0, "functions": 95.0}
+#
+# **100, deliberately, and only for this repo.** Elsewhere a 100% floor turns coverage into a target
+# and invites tests written to touch lines rather than to check them. Contracts are the exception:
+# they are immutable once deployed, so an unexercised line is not "not covered yet", it is a line
+# that will ship in that state forever and cannot be patched afterwards. There is also nowhere for
+# genuinely dead code to hide here — 175 lines, all of them reachable, as T-08 established by
+# reaching the last nine.
+#
+# What this floor does *not* claim is that the tests are good. Coverage counts execution; the suite
+# here once scored 2/12 against `script/mutate.sh` while looking healthy. **That** is the gate on
+# quality. This one only stops a line from going dark.
+#
+# If a change genuinely cannot reach a branch — a defensive guard against a compiler-impossible
+# state, say — the answer is to justify it in the commit message and lower the floor there, in view
+# of a reviewer. Not to quietly delete the branch, and not to write a test that executes it without
+# asserting anything.
+FLOORS = {"lines": 100.0, "statements": 100.0, "branches": 100.0, "functions": 100.0}
 ORDER = ["lines", "statements", "branches", "functions"]
 
 
