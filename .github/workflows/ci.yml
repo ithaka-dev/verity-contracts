@@ -50,6 +50,23 @@ jobs:
       - name: no ecrecover outside the checker
         run: python3 script/check-no-raw-ecrecover.py src
 
+  mutation:
+    name: mutation score
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      # Coverage counts lines executed and cannot tell an assertion from a bystander. This suite
+      # once scored 2 of 12 — `requireValidSignature` could be deleted outright and every test
+      # stayed green — while coverage looked healthy throughout. Each mutant is a bug that was found
+      # in review here, or one edit from one that was.
+      #
+      # A surviving mutant fails the build. So does a mutant that cannot be applied, because a
+      # mutant silently absent leaves the score looking complete while a behaviour went unchecked.
+      - run: ./script/mutate.sh --quick
+
   factory-holds-no-state:
     name: AppManifestFactory has no storage
     runs-on: ubuntu-latest
